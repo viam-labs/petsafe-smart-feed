@@ -34,6 +34,10 @@ class PetSafeFeeder(Generic):
     _tokens: dict | None = None
     _client: sf.PetSafeClient | None = None
     _feeder: Any | None = None
+    # True right after client.get_feeders() returns; lets us skip an
+    # update_data() call on the very first status refresh since the
+    # feeder's data is already fresh from the get_feeders response.
+    _feeder_data_fresh: bool = False
     _status_cache: dict | None = None
     _status_cache_expires: float = 0.0
     _status_lock: asyncio.Lock | None = None
@@ -73,6 +77,7 @@ class PetSafeFeeder(Generic):
         # Bust caches so token or feeder changes take effect immediately.
         self._client = None
         self._feeder = None
+        self._feeder_data_fresh = False
         self._status_cache = None
         self._status_cache_expires = 0.0
         self._status_lock = asyncio.Lock()
@@ -88,11 +93,11 @@ class PetSafeFeeder(Generic):
             )
         return self._client
 
-    def _resolve_feeder(self) -> Any:
+    async def _resolve_feeder(self) -> Any:
         if self._feeder is not None:
             return self._feeder
         client = self._get_client()
-        feeders = sf.devices.get_feeders(client)
+        feeders = await client.get_feeders()
         if not feeders:
             raise RuntimeError("No PetSafe feeders found on this account.")
         if self.feeder_id is None:
@@ -105,16 +110,15 @@ class PetSafeFeeder(Generic):
             if match is None:
                 raise RuntimeError(f"No feeder with id={self.feeder_id!r}.")
             self._feeder = match
+        self._feeder_data_fresh = True
         return self._feeder
 
     async def _feed(self, cups: float, slow: bool) -> dict:
         eighths = max(1, round(cups * EIGHTHS_PER_CUP))
-
-        def call() -> None:
-            feeder = self._resolve_feeder()
-            feeder.feed(amount=eighths, slow_feed=slow)
-
-        await asyncio.to_thread(call)
+        feeder = await self._resolve_feeder()
+        # update_data=False so we don't burn a read call after every
+        # feed; the status cache TTL is what decides when to refresh.
+        await feeder.feed(amount=eighths, slow_feed=slow, update_data=False)
         return {"ok": True, "cups": eighths / EIGHTHS_PER_CUP, "slow": slow}
 
     async def _status(self) -> dict:
@@ -129,18 +133,19 @@ class PetSafeFeeder(Generic):
             if self._status_cache is not None and time.time() < self._status_cache_expires:
                 return {**self._status_cache, "cached": True}
 
-            def call() -> dict:
-                feeder = self._resolve_feeder()
-                food_low = feeder.food_low_status
-                return {
-                    "id": getattr(feeder, "id", None),
-                    "name": getattr(feeder, "name", None),
-                    "battery_level": feeder.battery_level,
-                    "food_low_status": food_low,
-                    "food_state": ["ok", "low", "empty"][food_low],
-                }
+            feeder = await self._resolve_feeder()
+            if not self._feeder_data_fresh:
+                await feeder.update_data()
+            self._feeder_data_fresh = False
 
-            status = await asyncio.to_thread(call)
+            food_low = feeder.food_low_status
+            status = {
+                "id": feeder.id,
+                "name": feeder.friendly_name,
+                "battery_level": feeder.battery_level,
+                "food_low_status": food_low,
+                "food_state": ["ok", "low", "empty"][food_low],
+            }
             self._status_cache = status
             self._status_cache_expires = time.time() + STATUS_CACHE_TTL_SEC
             return {**status, "cached": False}
