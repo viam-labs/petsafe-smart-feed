@@ -501,7 +501,9 @@ class PetSafeFeeder(Generic):
         assert self._state is not None
         assert self._state_lock is not None
         if not isinstance(hours, int | float) or isinstance(hours, bool) or hours == 0:
-            raise ValueError("`hours` must be a non-zero number (positive = later, negative = earlier)")
+            raise ValueError(
+                "`hours` must be a non-zero number (positive = later, negative = earlier)"
+            )
         schedule_result = await self._schedule()
         schedules = schedule_result["schedules"]
         now_local = datetime.now().astimezone()
