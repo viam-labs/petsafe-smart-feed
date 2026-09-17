@@ -247,17 +247,18 @@ A manual `pause_schedule` with `paused: false` clears any pending
 ```
 
 Finds the next upcoming scheduled feeding (spanning to tomorrow if
-none remain today) and modifies its time to `now + hours`. Records
-an auto-restore in the state file so the background loop puts the
-original time back after the delayed firing completes (plus a
-15-minute margin).
+none remain today) and shifts its time by `hours` — positive delays,
+negative moves earlier. Records an auto-restore in the state file so
+the background loop puts the original time back after the moved
+firing completes (plus a 15-minute margin). Rejects a value that
+would put the resulting time in the past.
 
 Response:
 ```json
 {
   "ok": true,
   "schedule_id": "123456",
-  "delayed_to": "20:30",
+  "moved_to": "20:30",
   "restore_at": "2026-09-17T20:45:00+00:00"
 }
 ```
