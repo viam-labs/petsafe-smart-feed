@@ -31,6 +31,7 @@ class PetSafeFeeder(Generic):
 
     email: str
     feeder_id: str | None = None
+    target_meal_cups: float | None = None
     _tokens: dict | None = None
     _client: sf.PetSafeClient | None = None
     _feeder: Any | None = None
@@ -41,6 +42,9 @@ class PetSafeFeeder(Generic):
     _status_cache: dict | None = None
     _status_cache_expires: float = 0.0
     _status_lock: asyncio.Lock | None = None
+    _schedule_cache: list | None = None
+    _schedule_cache_expires: float = 0.0
+    _schedule_lock: asyncio.Lock | None = None
 
     @classmethod
     def new(
@@ -63,6 +67,9 @@ class PetSafeFeeder(Generic):
         for key in cls.TOKEN_KEYS:
             if not tokens.get(key):
                 raise ValueError(f"`tokens.{key}` is required")
+        target = attrs.get("target_meal_cups")
+        if target is not None and (not isinstance(target, int | float) or target <= 0):
+            raise ValueError("`target_meal_cups` must be a positive number if set")
         return []
 
     def reconfigure(
@@ -74,6 +81,8 @@ class PetSafeFeeder(Generic):
         self.email = attrs["email"]
         self._tokens = attrs["tokens"]
         self.feeder_id = attrs.get("feeder_id")
+        target = attrs.get("target_meal_cups")
+        self.target_meal_cups = float(target) if target is not None else None
         # Bust caches so token or feeder changes take effect immediately.
         self._client = None
         self._feeder = None
@@ -81,6 +90,9 @@ class PetSafeFeeder(Generic):
         self._status_cache = None
         self._status_cache_expires = 0.0
         self._status_lock = asyncio.Lock()
+        self._schedule_cache = None
+        self._schedule_cache_expires = 0.0
+        self._schedule_lock = asyncio.Lock()
 
     def _get_client(self) -> sf.PetSafeClient:
         if self._client is None:
@@ -145,10 +157,42 @@ class PetSafeFeeder(Generic):
                 "battery_level": feeder.battery_level,
                 "food_low_status": food_low,
                 "food_state": ["ok", "low", "empty"][food_low],
+                "is_paused": feeder.is_paused,
+                "is_slow_feed": feeder.is_slow_feed,
+                "target_meal_cups": self.target_meal_cups,
             }
             self._status_cache = status
             self._status_cache_expires = time.time() + STATUS_CACHE_TTL_SEC
             return {**status, "cached": False}
+
+    async def _schedule(self) -> dict:
+        if self._schedule_cache is not None and time.time() < self._schedule_cache_expires:
+            return {"schedules": self._schedule_cache, "cached": True}
+
+        assert self._schedule_lock is not None
+        async with self._schedule_lock:
+            if self._schedule_cache is not None and time.time() < self._schedule_cache_expires:
+                return {"schedules": self._schedule_cache, "cached": True}
+
+            feeder = await self._resolve_feeder()
+            raw = await feeder.get_schedules()
+            schedules = [
+                {
+                    "id": entry.get("id") or entry.get("schedule_id"),
+                    "time": entry.get("time"),
+                    "amount_eighths": entry.get("amount"),
+                    "cups": (entry.get("amount") or 0) / EIGHTHS_PER_CUP,
+                }
+                for entry in (raw or [])
+            ]
+            self._schedule_cache = schedules
+            self._schedule_cache_expires = time.time() + STATUS_CACHE_TTL_SEC
+            return {"schedules": schedules, "cached": False}
+
+    async def _pause_schedule(self, paused: bool) -> dict:
+        feeder = await self._resolve_feeder()
+        await feeder.pause_schedules(paused, update_data=False)
+        return {"ok": True, "paused": paused}
 
     async def do_command(
         self,
@@ -164,6 +208,10 @@ class PetSafeFeeder(Generic):
             return await self._feed(cups, slow)
         if cmd == "status":
             return await self._status()
+        if cmd == "schedule":
+            return await self._schedule()
+        if cmd == "pause_schedule":
+            return await self._pause_schedule(bool(command.get("paused")))
         raise ValueError(f"Unknown command: {cmd!r}")
 
 
