@@ -500,8 +500,10 @@ class PetSafeFeeder(Generic):
     async def _delay_next(self, hours: Any) -> dict:
         assert self._state is not None
         assert self._state_lock is not None
-        if not isinstance(hours, int | float) or isinstance(hours, bool) or hours <= 0:
-            raise ValueError("`hours` must be a positive number")
+        if not isinstance(hours, int | float) or isinstance(hours, bool) or hours == 0:
+            raise ValueError(
+                "`hours` must be a non-zero number (positive = later, negative = earlier)"
+            )
         schedule_result = await self._schedule()
         schedules = schedule_result["schedules"]
         now_local = datetime.now().astimezone()
@@ -509,20 +511,21 @@ class PetSafeFeeder(Generic):
         if not found:
             raise RuntimeError("No upcoming scheduled feedings.")
         next_sched, next_fire = found
-        # Delay = shift the scheduled fire time later by `hours`. Using
-        # `now + hours` here would let a small delay accidentally move
-        # the feeding EARLIER than it was scheduled (e.g. now=3pm,
-        # scheduled=6pm, delay=1h -> 4pm), which is the opposite of
-        # what "delay" means.
-        delayed_local = next_fire + timedelta(hours=hours)
-        delayed_hhmm = delayed_local.strftime("%H:%M")
+        # Shift the scheduled fire time by `hours` — positive delays,
+        # negative moves earlier. Computed from `next_fire` (not `now`)
+        # so a small "delay" doesn't accidentally end up earlier than
+        # the original.
+        moved_local = next_fire + timedelta(hours=hours)
+        if moved_local <= now_local:
+            raise ValueError("resulting time is in the past")
+        moved_hhmm = moved_local.strftime("%H:%M")
         restore_at = (
-            delayed_local + timedelta(minutes=RESTORE_MARGIN_MIN)
+            moved_local + timedelta(minutes=RESTORE_MARGIN_MIN)
         ).astimezone(UTC)
         async with self._state_lock:
             feeder = await self._resolve_feeder()
             await feeder.modify_schedule(
-                time=delayed_hhmm,
+                time=moved_hhmm,
                 amount=next_sched["amount_eighths"],
                 schedule_id=next_sched["id"],
                 update_data=False,
@@ -537,7 +540,7 @@ class PetSafeFeeder(Generic):
         return {
             "ok": True,
             "schedule_id": next_sched["id"],
-            "delayed_to": delayed_hhmm,
+            "moved_to": moved_hhmm,
             "restore_at": restore_at.isoformat(),
         }
 
