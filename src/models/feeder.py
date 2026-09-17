@@ -112,6 +112,9 @@ class PetSafeFeeder(Generic):
     _schedule_cache: list | None = None
     _schedule_cache_expires: float = 0.0
     _schedule_lock: asyncio.Lock | None = None
+    _last_feeding_cache: dict | None = None
+    _last_feeding_cache_expires: float = 0.0
+    _last_feeding_lock: asyncio.Lock | None = None
     _state: dict | None = None
     _state_lock: asyncio.Lock | None = None
     _bg_task: asyncio.Task | None = None
@@ -167,6 +170,9 @@ class PetSafeFeeder(Generic):
         self._schedule_cache = None
         self._schedule_cache_expires = 0.0
         self._schedule_lock = asyncio.Lock()
+        self._last_feeding_cache = None
+        self._last_feeding_cache_expires = 0.0
+        self._last_feeding_lock = asyncio.Lock()
         self._state_lock = asyncio.Lock()
         self._state = self._load_state()
         # Cancel any running background loop before starting a fresh one
@@ -306,28 +312,49 @@ class PetSafeFeeder(Generic):
                     LOGGER.warning("failed to restore delay %s (will retry): %s", sid, e)
 
             skips = list(self._state.get("skips") or [])
-            remaining = []
+            ready = []
+            pending = []
             for entry in skips:
                 try:
                     restore_at = datetime.fromisoformat(entry["restore_at"])
                 except (KeyError, ValueError, TypeError):
                     LOGGER.warning("invalid skip entry; dropping: %r", entry)
                     continue
-                if now < restore_at:
-                    remaining.append(entry)
-                    continue
+                (pending if now < restore_at else ready).append(entry)
+
+            if ready:
+                # Dedupe against current PetSafe schedules. If a matching
+                # (time, amount) already exists, treat the skip as restored
+                # and drop the state entry — this handles the case where a
+                # previous schedule_feed call ambiguously failed (network
+                # error after PetSafe committed) and we would otherwise
+                # create a duplicate on retry.
                 feeder = await self._resolve_feeder()
-                try:
-                    await feeder.schedule_feed(
-                        time=entry["original_time"],
-                        amount=entry["original_amount"],
-                        update_data=False,
-                    )
-                    schedule_changed = True
-                except Exception as e:
-                    LOGGER.warning("failed to restore skip %r (will retry): %s", entry, e)
-                    remaining.append(entry)
-            if len(remaining) != len(self._state.get("skips") or []):
+                current = await feeder.get_schedules()
+                existing = {
+                    (s.get("time"), s.get("amount")) for s in (current or [])
+                }
+                remaining = list(pending)
+                for entry in ready:
+                    signature = (entry["original_time"], entry["original_amount"])
+                    if signature in existing:
+                        schedule_changed = True
+                        continue
+                    try:
+                        await feeder.schedule_feed(
+                            time=entry["original_time"],
+                            amount=entry["original_amount"],
+                            update_data=False,
+                        )
+                        existing.add(signature)
+                        schedule_changed = True
+                    except Exception as e:
+                        LOGGER.warning("failed to restore skip %r (will retry): %s", entry, e)
+                        remaining.append(entry)
+            else:
+                remaining = pending
+
+            if len(remaining) != len(skips):
                 self._state["skips"] = remaining
                 changed = True
 
@@ -410,6 +437,28 @@ class PetSafeFeeder(Generic):
         # feed; the status cache TTL is what decides when to refresh.
         await feeder.feed(amount=eighths, slow_feed=slow, update_data=False)
         return {"ok": True, "cups": eighths / EIGHTHS_PER_CUP, "slow": slow}
+
+    async def _last_feeding(self) -> dict:
+        if (
+            self._last_feeding_cache is not None
+            and time.time() < self._last_feeding_cache_expires
+        ):
+            return {**self._last_feeding_cache, "cached": True}
+
+        assert self._last_feeding_lock is not None
+        async with self._last_feeding_lock:
+            if (
+                self._last_feeding_cache is not None
+                and time.time() < self._last_feeding_cache_expires
+            ):
+                return {**self._last_feeding_cache, "cached": True}
+
+            feeder = await self._resolve_feeder()
+            raw = await feeder.get_last_feeding()
+            payload = {"last_feeding": raw if isinstance(raw, dict) else None}
+            self._last_feeding_cache = payload
+            self._last_feeding_cache_expires = time.time() + STATUS_CACHE_TTL_SEC
+            return {**payload, "cached": False}
 
     async def _pause_schedule(self, paused: bool) -> dict:
         assert self._state is not None
@@ -639,6 +688,8 @@ class PetSafeFeeder(Generic):
             return await self._status()
         if cmd == "schedule":
             return await self._schedule()
+        if cmd == "last_feeding":
+            return await self._last_feeding()
         if cmd == "pause_schedule":
             return await self._pause_schedule(bool(command.get("paused")))
         if cmd == "pause_until":
