@@ -143,6 +143,30 @@ recur daily — there's no date component.
 
 Cached separately from `status` on the same 5-minute TTL.
 
+### Last feeding
+
+```json
+{ "command": "last_feeding" }
+```
+
+Returns the most recent `FEED_DONE` event from PetSafe's message log
+for the feeder (last 7 days).
+
+Response:
+```json
+{
+  "last_feeding": {
+    "message_type": "FEED_DONE",
+    "created_at": "2026-09-17T18:00:00Z",
+    "payload": { "amount": 8 }
+  },
+  "cached": false
+}
+```
+
+`last_feeding` is `null` if no feeding was found in the past 7 days.
+Cached for 5 minutes.
+
 ### Pause schedule
 
 ```json
