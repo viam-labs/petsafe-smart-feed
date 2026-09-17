@@ -1,9 +1,7 @@
 import asyncio
-import json
 import logging
 import time
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import Any, ClassVar, Self
 
 import petsafe as sf
@@ -29,9 +27,11 @@ EIGHTHS_PER_CUP = 8
 class PetSafeFeeder(Generic):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam", "petsafe"), "smart-feed")
 
+    TOKEN_KEYS: ClassVar[tuple[str, ...]] = ("id_token", "refresh_token", "access_token")
+
     email: str
-    token_path: str
     feeder_id: str | None = None
+    _tokens: dict | None = None
     _client: sf.PetSafeClient | None = None
     _feeder: Any | None = None
     _status_cache: dict | None = None
@@ -53,8 +53,12 @@ class PetSafeFeeder(Generic):
         attrs = struct_to_dict(config.attributes)
         if not attrs.get("email"):
             raise ValueError("`email` attribute is required")
-        if not attrs.get("token_path"):
-            raise ValueError("`token_path` attribute is required")
+        tokens = attrs.get("tokens")
+        if not isinstance(tokens, dict):
+            raise ValueError("`tokens` attribute is required and must be an object")
+        for key in cls.TOKEN_KEYS:
+            if not tokens.get(key):
+                raise ValueError(f"`tokens.{key}` is required")
         return []
 
     def reconfigure(
@@ -64,7 +68,7 @@ class PetSafeFeeder(Generic):
     ) -> None:
         attrs = struct_to_dict(config.attributes)
         self.email = attrs["email"]
-        self.token_path = attrs["token_path"]
+        self._tokens = attrs["tokens"]
         self.feeder_id = attrs.get("feeder_id")
         # Bust caches so token or feeder changes take effect immediately.
         self._client = None
@@ -73,23 +77,14 @@ class PetSafeFeeder(Generic):
         self._status_cache_expires = 0.0
         self._status_lock = asyncio.Lock()
 
-    def _load_tokens(self) -> dict:
-        path = Path(self.token_path).expanduser()
-        if not path.exists():
-            raise RuntimeError(
-                f"PetSafe token file not found at {path}. "
-                "Run `python -m petsafe <email>` to generate tokens."
-            )
-        return json.loads(path.read_text())
-
     def _get_client(self) -> sf.PetSafeClient:
         if self._client is None:
-            tokens = self._load_tokens()
+            assert self._tokens is not None
             self._client = sf.PetSafeClient(
                 email=self.email,
-                id_token=tokens["id_token"],
-                refresh_token=tokens["refresh_token"],
-                access_token=tokens["access_token"],
+                id_token=self._tokens["id_token"],
+                refresh_token=self._tokens["refresh_token"],
+                access_token=self._tokens["access_token"],
             )
         return self._client
 

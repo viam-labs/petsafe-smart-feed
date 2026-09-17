@@ -21,27 +21,19 @@ this module currently exposes only the feeder.
 ## Getting tokens (one-time)
 
 PetSafe's cloud API uses AWS Cognito with an email-code login flow.
-Run this once on any machine (your laptop is fine):
+Run this once on any machine with Python (your laptop is fine). On
+macOS with Homebrew Python, use a throwaway venv to sidestep PEP 668:
 
 ```bash
-pip install petsafe-api
-python -m petsafe your.email@example.com
+python3 -m venv /tmp/petsafe-venv
+/tmp/petsafe-venv/bin/pip install petsafe-api
+/tmp/petsafe-venv/bin/python -m petsafe your.email@example.com
 # Check your email for a 6-digit code, paste it in.
 # The command prints id_token, refresh_token, access_token.
 ```
 
-Save the three tokens to a JSON file on the machine that runs
-`viam-server`, e.g. `/etc/viam/petsafe-tokens.json`:
-
-```json
-{
-  "id_token": "...",
-  "refresh_token": "...",
-  "access_token": "..."
-}
-```
-
-Restrict permissions: `chmod 600 /etc/viam/petsafe-tokens.json`.
+Copy the three tokens — they go directly into the component config
+below. You can delete the venv when you're done.
 
 ## Configuration
 
@@ -54,7 +46,11 @@ Add a Generic component with model `viam:petsafe:smart-feed`:
   "model": "viam:petsafe:smart-feed",
   "attributes": {
     "email": "your.email@example.com",
-    "token_path": "/etc/viam/petsafe-tokens.json",
+    "tokens": {
+      "id_token": "...",
+      "refresh_token": "...",
+      "access_token": "..."
+    },
     "feeder_id": "optional-specific-feeder-id"
   }
 }
@@ -62,6 +58,13 @@ Add a Generic component with model `viam:petsafe:smart-feed`:
 
 If `feeder_id` is omitted, the first feeder on the account is used —
 fine if you only have one.
+
+Tokens live inline in the machine config; they're stored in Viam Cloud
+alongside the rest of the config. The refresh token typically lasts
+~30 days, at which point you'll need to re-run the token dance and
+update the config. Access tokens are refreshed in memory during
+runtime but are not persisted back to config, so the original tokens
+you paste in are what's used every time the module restarts.
 
 ## Commands
 
