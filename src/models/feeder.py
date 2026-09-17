@@ -2,11 +2,11 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, ClassVar, Mapping, Optional, Sequence
+from typing import Any, ClassVar, Self
 
 import petsafe as sf
-from typing_extensions import Self
 from viam.components.generic import Generic
 from viam.proto.app.robot import ComponentConfig
 from viam.proto.common import ResourceName
@@ -31,12 +31,12 @@ class PetSafeFeeder(Generic):
 
     email: str
     token_path: str
-    feeder_id: Optional[str] = None
-    _client: Optional[sf.PetSafeClient] = None
-    _feeder: Optional[Any] = None
-    _status_cache: Optional[dict] = None
+    feeder_id: str | None = None
+    _client: sf.PetSafeClient | None = None
+    _feeder: Any | None = None
+    _status_cache: dict | None = None
     _status_cache_expires: float = 0.0
-    _status_lock: Optional[asyncio.Lock] = None
+    _status_lock: asyncio.Lock | None = None
 
     @classmethod
     def new(
@@ -154,7 +154,7 @@ class PetSafeFeeder(Generic):
         self,
         command: Mapping[str, Any],
         *,
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
         **kwargs: Any,
     ) -> Mapping[str, Any]:
         cmd = command.get("command")
