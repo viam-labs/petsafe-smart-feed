@@ -52,7 +52,8 @@ Add a Generic component with model `viam:petsafe:smart-feed`:
       "access_token": "..."
     },
     "feeder_id": "optional-specific-feeder-id",
-    "target_meal_cups": 1
+    "target_meal_cups": 1,
+    "state_path": "~/.viam/petsafe-smart-feed-state.json"
   }
 }
 ```
@@ -63,6 +64,10 @@ fine if you only have one.
 `target_meal_cups` (optional) is the pet's normal meal size in cups.
 Clients use it to default the Feed Now amount and to visually compare
 against scheduled amounts. It's echoed back in `status` responses.
+
+`state_path` (optional, default `~/.viam/petsafe-smart-feed-state.json`)
+is where the module stores pending auto-restore state for `pause_until`,
+`delay_next`, `skip_next`, and `feed_now`. See "Auto-restore" below.
 
 Tokens live inline in the machine config; they're stored in Viam Cloud
 alongside the rest of the config. The refresh token typically lasts
@@ -190,6 +195,112 @@ Response:
 ```json
 { "ok": true, "id": "123456" }
 ```
+
+### Pause until
+
+```json
+{ "command": "pause_until", "until": "2026-09-25T12:00:00" }
+```
+
+Pauses all scheduled feedings and records a wake time in the state
+file. A background loop wakes every minute and unpauses schedules
+once the wake time has passed — even if the app is never opened.
+Naive datetimes are interpreted as machine local time; ISO strings
+with a timezone (e.g. `...+00:00`) are honored as-is.
+
+Response:
+```json
+{ "ok": true, "pause_until": "2026-09-25T16:00:00+00:00" }
+```
+
+A manual `pause_schedule` with `paused: false` clears any pending
+`pause_until`.
+
+### Delay next
+
+```json
+{ "command": "delay_next", "hours": 1 }
+```
+
+Finds the next upcoming scheduled feeding (spanning to tomorrow if
+none remain today) and modifies its time to `now + hours`. Records
+an auto-restore in the state file so the background loop puts the
+original time back after the delayed firing completes (plus a
+15-minute margin).
+
+Response:
+```json
+{
+  "ok": true,
+  "schedule_id": "123456",
+  "delayed_to": "20:30",
+  "restore_at": "2026-09-17T20:45:00+00:00"
+}
+```
+
+### Skip next
+
+```json
+{ "command": "skip_next" }
+```
+
+Deletes the next upcoming scheduled feeding and records an
+auto-restore. The background loop re-adds the entry with the
+original time and amount after its "would-have-fired" moment plus
+the restore margin.
+
+Response:
+```json
+{
+  "ok": true,
+  "skipped_time": "18:00",
+  "skipped_cups": 1.0,
+  "restore_at": "2026-09-17T18:15:00+00:00"
+}
+```
+
+### Feed now
+
+```json
+{ "command": "feed_now" }
+```
+
+Composite action: feeds the pet with the next scheduled meal's
+amount **and** skips that scheduled entry (auto-restored later).
+Falls back to `target_meal_cups` from config if no upcoming
+schedule exists.
+
+Response:
+```json
+{
+  "ok": true,
+  "fed_cups": 1.0,
+  "skip": {
+    "original_time": "18:00",
+    "restore_at": "2026-09-17T18:15:00+00:00"
+  }
+}
+```
+
+## Auto-restore state
+
+Time-triggered commands (`pause_until`, `delay_next`, `skip_next`,
+`feed_now`) modify the schedule on PetSafe's side and record a
+pending "put it back" action in `state_path` (default
+`~/.viam/petsafe-smart-feed-state.json`).
+
+A background loop wakes every 60 seconds and processes any expired
+entries. Idle ticks make zero PetSafe calls — the loop only reaches
+PetSafe when it actually has work to do. Any failed restore is
+retried on the next tick, so a transient PetSafe outage doesn't
+leave the schedule permanently modified.
+
+If the machine is off during a restore window, the entry stays
+pending — the loop restores it on the first tick after the machine
+boots.
+
+`status` responses include a snapshot of the current state:
+`pause_until`, `delayed_schedule_ids`, `skipped_count`.
 
 ## Rate limiting
 
