@@ -13,7 +13,7 @@ Known gaps this module cannot fix on its own. Do not paper over them — referen
 
 - **5-minute account lockout on frequent reads (severity: high).** PetSafe locks accounts that read device data more than once per 5 minutes. The `_status` cache TTL (`STATUS_CACHE_TTL_SEC = 300`) is a hard requirement, not a preference. Do not shorten it. Do not add new read commands without either sharing the same cache or introducing an equivalent one.
 
-- **`petsafe-api` feeder methods are synchronous (severity: low).** The library's Smart Feed API is blocking; only Smart Door methods are async. Every feeder call in this module wraps the underlying call in `asyncio.to_thread` to avoid stalling Viam's event loop. If a new feeder method is added upstream as async, drop the wrapper — do not leave a `to_thread` call around an already-async method.
+- **`petsafe-api` README is out of date (severity: medium).** The README's Smart Feed examples show a sync API (`sf.devices.get_feeders(client)`, `feeder.feed(...)` without await), but the actual code as of v2.x is fully async — methods live on the `PetSafeClient` (`await client.get_feeders()`) and every device method is a coroutine. If you're changing behavior, read `petsafe/client.py` and `petsafe/devices.py` directly, not the README. Upstream issues are disabled on the repo, so no filing path — mention when you update the pinned dep.
 
 - **No browser JS SDK for PetSafe (severity: medium).** Clients calling this module must go through the Viam SDK / `do_command`; there is no browser-side alternative. If someone wants a direct-from-frontend flow, this module is the only path.
 
