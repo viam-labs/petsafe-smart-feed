@@ -1,8 +1,11 @@
 import asyncio
+import json
 import logging
 import re
 import time
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, ClassVar, Self
 
 import petsafe as sf
@@ -23,6 +26,18 @@ STATUS_CACHE_TTL_SEC = 300
 # The petsafe library counts feed amount in 1/8-cup increments; the
 # smallest possible dispense is 1 (= 1/8 cup).
 EIGHTHS_PER_CUP = 8
+
+DEFAULT_STATE_PATH = "~/.viam/petsafe-smart-feed-state.json"
+
+# How often the background loop wakes to process pending state
+# transitions. Local check only — no PetSafe hits unless there is
+# actual work to do.
+BG_LOOP_INTERVAL_SEC = 60
+
+# Buffer after a scheduled feeding's original time before we restore
+# a skipped or delayed entry. Wide enough that PetSafe has moved past
+# the fire moment; tight enough that same-day resumption is likely.
+RESTORE_MARGIN_MIN = 15
 
 _TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 
@@ -45,6 +60,36 @@ def _cups_to_eighths(value: Any) -> int:
     return max(1, round(value * EIGHTHS_PER_CUP))
 
 
+def _find_next_schedule(schedules: list, now: datetime) -> tuple | None:
+    """Return (schedule_entry, datetime_when_it_next_fires) or None.
+
+    Schedules recur daily, so a 07:00 entry with now=08:00 fires at 07:00
+    tomorrow. Assumes both `now` and schedule times are the same timezone.
+    """
+    best_dt = None
+    best_sched = None
+    for s in schedules or []:
+        t = s.get("time") or ""
+        if ":" not in t:
+            continue
+        try:
+            h, mi = map(int, t.split(":"))
+        except ValueError:
+            continue
+        today = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+        candidate = today if today > now else today + timedelta(days=1)
+        if best_dt is None or candidate < best_dt:
+            best_dt = candidate
+            best_sched = s
+    if best_sched is None:
+        return None
+    return best_sched, best_dt
+
+
+def _empty_state() -> dict:
+    return {"pause_until": None, "delays": {}, "skips": []}
+
+
 class PetSafeFeeder(Generic):
     MODEL: ClassVar[Model] = Model(ModelFamily("viam", "petsafe"), "smart-feed")
 
@@ -53,6 +98,7 @@ class PetSafeFeeder(Generic):
     email: str
     feeder_id: str | None = None
     target_meal_cups: float | None = None
+    state_path: str = DEFAULT_STATE_PATH
     _tokens: dict | None = None
     _client: sf.PetSafeClient | None = None
     _feeder: Any | None = None
@@ -66,6 +112,9 @@ class PetSafeFeeder(Generic):
     _schedule_cache: list | None = None
     _schedule_cache_expires: float = 0.0
     _schedule_lock: asyncio.Lock | None = None
+    _state: dict | None = None
+    _state_lock: asyncio.Lock | None = None
+    _bg_task: asyncio.Task | None = None
 
     @classmethod
     def new(
@@ -91,6 +140,9 @@ class PetSafeFeeder(Generic):
         target = attrs.get("target_meal_cups")
         if target is not None and (not isinstance(target, int | float) or target <= 0):
             raise ValueError("`target_meal_cups` must be a positive number if set")
+        state_path = attrs.get("state_path")
+        if state_path is not None and not isinstance(state_path, str):
+            raise ValueError("`state_path` must be a string if set")
         return []
 
     def reconfigure(
@@ -104,6 +156,7 @@ class PetSafeFeeder(Generic):
         self.feeder_id = attrs.get("feeder_id")
         target = attrs.get("target_meal_cups")
         self.target_meal_cups = float(target) if target is not None else None
+        self.state_path = str(attrs.get("state_path") or DEFAULT_STATE_PATH)
         # Bust caches so token or feeder changes take effect immediately.
         self._client = None
         self._feeder = None
@@ -114,6 +167,18 @@ class PetSafeFeeder(Generic):
         self._schedule_cache = None
         self._schedule_cache_expires = 0.0
         self._schedule_lock = asyncio.Lock()
+        self._state_lock = asyncio.Lock()
+        self._state = self._load_state()
+        # Cancel any running background loop before starting a fresh one
+        # so config changes take effect immediately.
+        if self._bg_task and not self._bg_task.done():
+            self._bg_task.cancel()
+        try:
+            self._bg_task = asyncio.create_task(self._bg_loop())
+        except RuntimeError:
+            # No running event loop yet — the module server will call
+            # reconfigure again once the loop is up.
+            self._bg_task = None
 
     def _get_client(self) -> sf.PetSafeClient:
         if self._client is None:
@@ -146,15 +211,136 @@ class PetSafeFeeder(Generic):
         self._feeder_data_fresh = True
         return self._feeder
 
-    async def _feed(self, cups: float, slow: bool) -> dict:
-        eighths = max(1, round(cups * EIGHTHS_PER_CUP))
-        feeder = await self._resolve_feeder()
-        # update_data=False so we don't burn a read call after every
-        # feed; the status cache TTL is what decides when to refresh.
-        await feeder.feed(amount=eighths, slow_feed=slow, update_data=False)
-        return {"ok": True, "cups": eighths / EIGHTHS_PER_CUP, "slow": slow}
+    # ------------------------------------------------------------------
+    # State persistence
 
-    async def _status(self) -> dict:
+    def _load_state(self) -> dict:
+        path = Path(self.state_path).expanduser()
+        if not path.exists():
+            return _empty_state()
+        try:
+            loaded = json.loads(path.read_text())
+        except Exception as e:
+            LOGGER.warning("failed to load state from %s (using empty): %s", path, e)
+            return _empty_state()
+        merged = _empty_state()
+        merged.update({k: v for k, v in loaded.items() if k in merged})
+        return merged
+
+    def _save_state(self) -> None:
+        """Write self._state atomically. Caller must hold _state_lock."""
+        assert self._state is not None
+        path = Path(self.state_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self._state, indent=2))
+        tmp.replace(path)
+
+    def _state_snapshot(self) -> dict:
+        s = self._state or {}
+        return {
+            "pause_until": s.get("pause_until"),
+            "delayed_schedule_ids": list((s.get("delays") or {}).keys()),
+            "skipped_count": len(s.get("skips") or []),
+        }
+
+    # ------------------------------------------------------------------
+    # Background loop
+
+    async def _bg_loop(self) -> None:
+        while True:
+            try:
+                await self._process_state()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                LOGGER.warning("bg state loop tick failed: %s", e)
+            await asyncio.sleep(BG_LOOP_INTERVAL_SEC)
+
+    async def _process_state(self) -> None:
+        assert self._state is not None
+        assert self._state_lock is not None
+        now = datetime.now(timezone.utc)
+        async with self._state_lock:
+            changed = False
+            schedule_changed = False
+
+            pause_until_iso = self._state.get("pause_until")
+            if pause_until_iso:
+                try:
+                    pu_dt = datetime.fromisoformat(pause_until_iso)
+                except ValueError:
+                    LOGGER.warning("invalid pause_until %r in state; clearing", pause_until_iso)
+                    self._state["pause_until"] = None
+                    changed = True
+                else:
+                    if now >= pu_dt:
+                        feeder = await self._resolve_feeder()
+                        await feeder.pause_schedules(False, update_data=False)
+                        self._state["pause_until"] = None
+                        changed = True
+
+            delays = dict(self._state.get("delays") or {})
+            for sid, entry in delays.items():
+                try:
+                    restore_at = datetime.fromisoformat(entry["restore_at"])
+                except (KeyError, ValueError, TypeError):
+                    LOGGER.warning("invalid delay entry for %s; dropping", sid)
+                    del self._state["delays"][sid]
+                    changed = True
+                    continue
+                if now < restore_at:
+                    continue
+                feeder = await self._resolve_feeder()
+                try:
+                    await feeder.modify_schedule(
+                        time=entry["original_time"],
+                        amount=entry["original_amount"],
+                        schedule_id=sid,
+                        update_data=False,
+                    )
+                    del self._state["delays"][sid]
+                    changed = True
+                    schedule_changed = True
+                except Exception as e:
+                    LOGGER.warning("failed to restore delay %s (will retry): %s", sid, e)
+
+            skips = list(self._state.get("skips") or [])
+            remaining = []
+            for entry in skips:
+                try:
+                    restore_at = datetime.fromisoformat(entry["restore_at"])
+                except (KeyError, ValueError, TypeError):
+                    LOGGER.warning("invalid skip entry; dropping: %r", entry)
+                    continue
+                if now < restore_at:
+                    remaining.append(entry)
+                    continue
+                feeder = await self._resolve_feeder()
+                try:
+                    await feeder.schedule_feed(
+                        time=entry["original_time"],
+                        amount=entry["original_amount"],
+                        update_data=False,
+                    )
+                    schedule_changed = True
+                except Exception as e:
+                    LOGGER.warning("failed to restore skip %r (will retry): %s", entry, e)
+                    remaining.append(entry)
+            if len(remaining) != len(self._state.get("skips") or []):
+                self._state["skips"] = remaining
+                changed = True
+
+            if changed:
+                self._save_state()
+            if schedule_changed:
+                self._schedule_cache = None
+                self._status_cache = None
+
+    # ------------------------------------------------------------------
+    # Reads
+
+    async def _get_petsafe_status(self) -> dict:
         if self._status_cache is not None and time.time() < self._status_cache_expires:
             return {**self._status_cache, "cached": True}
 
@@ -186,6 +372,10 @@ class PetSafeFeeder(Generic):
             self._status_cache_expires = time.time() + STATUS_CACHE_TTL_SEC
             return {**status, "cached": False}
 
+    async def _status(self) -> dict:
+        petsafe = await self._get_petsafe_status()
+        return {**petsafe, **self._state_snapshot()}
+
     async def _schedule(self) -> dict:
         if self._schedule_cache is not None and time.time() < self._schedule_cache_expires:
             return {"schedules": self._schedule_cache, "cached": True}
@@ -210,10 +400,159 @@ class PetSafeFeeder(Generic):
             self._schedule_cache_expires = time.time() + STATUS_CACHE_TTL_SEC
             return {"schedules": schedules, "cached": False}
 
-    async def _pause_schedule(self, paused: bool) -> dict:
+    # ------------------------------------------------------------------
+    # Writes
+
+    async def _feed(self, cups: float, slow: bool) -> dict:
+        eighths = max(1, round(cups * EIGHTHS_PER_CUP))
         feeder = await self._resolve_feeder()
-        await feeder.pause_schedules(paused, update_data=False)
+        # update_data=False so we don't burn a read call after every
+        # feed; the status cache TTL is what decides when to refresh.
+        await feeder.feed(amount=eighths, slow_feed=slow, update_data=False)
+        return {"ok": True, "cups": eighths / EIGHTHS_PER_CUP, "slow": slow}
+
+    async def _pause_schedule(self, paused: bool) -> dict:
+        assert self._state is not None
+        assert self._state_lock is not None
+        async with self._state_lock:
+            feeder = await self._resolve_feeder()
+            await feeder.pause_schedules(paused, update_data=False)
+            # A manual unpause clears any pending vacation-style pause_until
+            # so the background loop doesn't try to unpause an already-active
+            # schedule later.
+            if not paused and self._state.get("pause_until"):
+                self._state["pause_until"] = None
+                self._save_state()
         return {"ok": True, "paused": paused}
+
+    async def _pause_until(self, until_value: Any) -> dict:
+        assert self._state is not None
+        assert self._state_lock is not None
+        if not isinstance(until_value, str):
+            raise ValueError("`until` must be an ISO-8601 datetime string")
+        try:
+            until = datetime.fromisoformat(until_value)
+        except ValueError as e:
+            raise ValueError(f"invalid `until`: {e}") from e
+        if until.tzinfo is None:
+            # Naive input from a browser <input type="datetime-local"> —
+            # interpret as local machine time.
+            until = until.astimezone()
+        until_utc = until.astimezone(timezone.utc)
+        if until_utc <= datetime.now(timezone.utc):
+            raise ValueError("`until` must be in the future")
+        async with self._state_lock:
+            feeder = await self._resolve_feeder()
+            await feeder.pause_schedules(True, update_data=False)
+            self._state["pause_until"] = until_utc.isoformat()
+            self._save_state()
+        return {"ok": True, "pause_until": until_utc.isoformat()}
+
+    async def _delay_next(self, hours: Any) -> dict:
+        assert self._state is not None
+        assert self._state_lock is not None
+        if not isinstance(hours, int | float) or isinstance(hours, bool) or hours <= 0:
+            raise ValueError("`hours` must be a positive number")
+        schedule_result = await self._schedule()
+        schedules = schedule_result["schedules"]
+        now_local = datetime.now().astimezone()
+        found = _find_next_schedule(schedules, now_local)
+        if not found:
+            raise RuntimeError("No upcoming scheduled feedings.")
+        next_sched, _ = found
+        delayed_local = now_local + timedelta(hours=hours)
+        delayed_hhmm = delayed_local.strftime("%H:%M")
+        restore_at = (
+            delayed_local + timedelta(minutes=RESTORE_MARGIN_MIN)
+        ).astimezone(timezone.utc)
+        async with self._state_lock:
+            feeder = await self._resolve_feeder()
+            await feeder.modify_schedule(
+                time=delayed_hhmm,
+                amount=next_sched["amount_eighths"],
+                schedule_id=next_sched["id"],
+                update_data=False,
+            )
+            self._state["delays"][next_sched["id"]] = {
+                "restore_at": restore_at.isoformat(),
+                "original_time": next_sched["time"],
+                "original_amount": next_sched["amount_eighths"],
+            }
+            self._save_state()
+        self._schedule_cache = None
+        return {
+            "ok": True,
+            "schedule_id": next_sched["id"],
+            "delayed_to": delayed_hhmm,
+            "restore_at": restore_at.isoformat(),
+        }
+
+    async def _skip_next(self) -> dict:
+        assert self._state is not None
+        assert self._state_lock is not None
+        schedule_result = await self._schedule()
+        schedules = schedule_result["schedules"]
+        now_local = datetime.now().astimezone()
+        found = _find_next_schedule(schedules, now_local)
+        if not found:
+            raise RuntimeError("No upcoming scheduled feedings.")
+        next_sched, next_fire = found
+        restore_at = (
+            next_fire + timedelta(minutes=RESTORE_MARGIN_MIN)
+        ).astimezone(timezone.utc)
+        async with self._state_lock:
+            feeder = await self._resolve_feeder()
+            await feeder.delete_schedule(next_sched["id"], update_data=False)
+            self._state["skips"].append({
+                "restore_at": restore_at.isoformat(),
+                "original_time": next_sched["time"],
+                "original_amount": next_sched["amount_eighths"],
+            })
+            self._save_state()
+        self._schedule_cache = None
+        return {
+            "ok": True,
+            "skipped_time": next_sched["time"],
+            "skipped_cups": next_sched["cups"],
+            "restore_at": restore_at.isoformat(),
+        }
+
+    async def _feed_now(self) -> dict:
+        assert self._state is not None
+        assert self._state_lock is not None
+        schedule_result = await self._schedule()
+        schedules = schedule_result["schedules"]
+        now_local = datetime.now().astimezone()
+        found = _find_next_schedule(schedules, now_local)
+        skip_info = None
+        if found:
+            next_sched, next_fire = found
+            amount_cups = next_sched["cups"]
+            restore_at = (
+                next_fire + timedelta(minutes=RESTORE_MARGIN_MIN)
+            ).astimezone(timezone.utc)
+            async with self._state_lock:
+                feeder = await self._resolve_feeder()
+                await feeder.delete_schedule(next_sched["id"], update_data=False)
+                self._state["skips"].append({
+                    "restore_at": restore_at.isoformat(),
+                    "original_time": next_sched["time"],
+                    "original_amount": next_sched["amount_eighths"],
+                })
+                self._save_state()
+            self._schedule_cache = None
+            skip_info = {
+                "original_time": next_sched["time"],
+                "restore_at": restore_at.isoformat(),
+            }
+        else:
+            if self.target_meal_cups is None:
+                raise RuntimeError(
+                    "No upcoming schedule to substitute and `target_meal_cups` is not configured."
+                )
+            amount_cups = self.target_meal_cups
+        await self._feed(amount_cups, slow=False)
+        return {"ok": True, "fed_cups": amount_cups, "skip": skip_info}
 
     async def _add_schedule(self, time_value: Any, cups: Any) -> dict:
         hhmm = _normalize_time(time_value)
@@ -249,6 +588,14 @@ class PetSafeFeeder(Generic):
             update_data=False,
         )
         self._schedule_cache = None
+        # A manual edit invalidates any pending auto-restore for this
+        # entry: the user has taken over, so drop the ghost restore.
+        assert self._state is not None
+        assert self._state_lock is not None
+        async with self._state_lock:
+            if schedule_id in (self._state.get("delays") or {}):
+                del self._state["delays"][schedule_id]
+                self._save_state()
         return {
             "ok": True,
             "id": schedule_id,
@@ -263,6 +610,12 @@ class PetSafeFeeder(Generic):
         feeder = await self._resolve_feeder()
         await feeder.delete_schedule(schedule_id, update_data=False)
         self._schedule_cache = None
+        assert self._state is not None
+        assert self._state_lock is not None
+        async with self._state_lock:
+            if schedule_id in (self._state.get("delays") or {}):
+                del self._state["delays"][schedule_id]
+                self._save_state()
         return {"ok": True, "id": schedule_id}
 
     async def do_command(
@@ -283,6 +636,14 @@ class PetSafeFeeder(Generic):
             return await self._schedule()
         if cmd == "pause_schedule":
             return await self._pause_schedule(bool(command.get("paused")))
+        if cmd == "pause_until":
+            return await self._pause_until(command.get("until"))
+        if cmd == "delay_next":
+            return await self._delay_next(command.get("hours"))
+        if cmd == "skip_next":
+            return await self._skip_next()
+        if cmd == "feed_now":
+            return await self._feed_now()
         if cmd == "add_schedule":
             return await self._add_schedule(command.get("time"), command.get("cups"))
         if cmd == "modify_schedule":
