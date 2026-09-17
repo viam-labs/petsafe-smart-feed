@@ -27,6 +27,18 @@ STATUS_CACHE_TTL_SEC = 300
 # smallest possible dispense is 1 (= 1/8 cup).
 EIGHTHS_PER_CUP = 8
 
+# PetSafe has used a few different keys for the schedule id across
+# firmware / API versions. Check them in order — first non-empty wins.
+_SCHEDULE_ID_KEYS = ("id", "schedule_id", "_id", "scheduleId", "feedingId")
+
+
+def _extract_schedule_id(entry: dict) -> str | None:
+    for key in _SCHEDULE_ID_KEYS:
+        value = entry.get(key)
+        if value:
+            return str(value)
+    return None
+
 DEFAULT_STATE_PATH = "~/.viam/petsafe-smart-feed-state.json"
 
 # How often the background loop wakes to process pending state
@@ -414,15 +426,22 @@ class PetSafeFeeder(Generic):
 
             feeder = await self._resolve_feeder()
             raw = await feeder.get_schedules()
-            schedules = [
-                {
-                    "id": entry.get("id") or entry.get("schedule_id"),
+            schedules = []
+            for entry in (raw or []):
+                if not isinstance(entry, dict):
+                    continue
+                sid = _extract_schedule_id(entry)
+                if sid is None:
+                    LOGGER.warning(
+                        "schedule entry has no recognized id key; keys=%s",
+                        sorted(entry.keys()),
+                    )
+                schedules.append({
+                    "id": sid,
                     "time": entry.get("time"),
                     "amount_eighths": entry.get("amount"),
                     "cups": (entry.get("amount") or 0) / EIGHTHS_PER_CUP,
-                }
-                for entry in (raw or [])
-            ]
+                })
             self._schedule_cache = schedules
             self._schedule_cache_expires = time.time() + STATUS_CACHE_TTL_SEC
             return {"schedules": schedules, "cached": False}
@@ -621,7 +640,7 @@ class PetSafeFeeder(Generic):
         self._schedule_cache = None
         new_id = None
         if isinstance(response, dict):
-            new_id = response.get("id") or response.get("schedule_id")
+            new_id = _extract_schedule_id(response)
         return {
             "ok": True,
             "schedule": {
