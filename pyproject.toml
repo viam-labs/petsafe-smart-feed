@@ -12,7 +12,6 @@ requires-python = ">=3.11"
 dependencies = [
     "viam-sdk>=0.30",
     "petsafe-api>=2.0",
-    "typing-extensions",
 ]
 
 [project.optional-dependencies]

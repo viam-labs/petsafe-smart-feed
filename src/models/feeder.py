@@ -2,11 +2,11 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, ClassVar, Mapping, Optional, Sequence
+from typing import Any, ClassVar, Self
 
 import petsafe as sf
-from typing_extensions import Self
 from viam.components.generic import Generic
 from viam.proto.app.robot import ComponentConfig
 from viam.proto.common import ResourceName
@@ -31,11 +31,12 @@ class PetSafeFeeder(Generic):
 
     email: str
     token_path: str
-    feeder_id: Optional[str] = None
-    _client: Optional[sf.PetSafeClient] = None
-    _feeder: Optional[Any] = None
-    _status_cache: Optional[dict] = None
+    feeder_id: str | None = None
+    _client: sf.PetSafeClient | None = None
+    _feeder: Any | None = None
+    _status_cache: dict | None = None
     _status_cache_expires: float = 0.0
+    _status_lock: asyncio.Lock | None = None
 
     @classmethod
     def new(
@@ -70,6 +71,7 @@ class PetSafeFeeder(Generic):
         self._feeder = None
         self._status_cache = None
         self._status_cache_expires = 0.0
+        self._status_lock = asyncio.Lock()
 
     def _load_tokens(self) -> dict:
         path = Path(self.token_path).expanduser()
@@ -121,31 +123,38 @@ class PetSafeFeeder(Generic):
         return {"ok": True, "cups": eighths / EIGHTHS_PER_CUP, "slow": slow}
 
     async def _status(self) -> dict:
-        now = time.time()
-        if self._status_cache is not None and now < self._status_cache_expires:
+        if self._status_cache is not None and time.time() < self._status_cache_expires:
             return {**self._status_cache, "cached": True}
 
-        def call() -> dict:
-            feeder = self._resolve_feeder()
-            food_low = feeder.food_low_status
-            return {
-                "id": getattr(feeder, "id", None),
-                "name": getattr(feeder, "name", None),
-                "battery_level": feeder.battery_level,
-                "food_low_status": food_low,
-                "food_state": ["ok", "low", "empty"][food_low],
-            }
+        # Serialize concurrent first-time reads so we only make one PetSafe
+        # request per 5-minute window even if the frontend fires two
+        # calls back-to-back before the cache is populated.
+        assert self._status_lock is not None
+        async with self._status_lock:
+            if self._status_cache is not None and time.time() < self._status_cache_expires:
+                return {**self._status_cache, "cached": True}
 
-        status = await asyncio.to_thread(call)
-        self._status_cache = status
-        self._status_cache_expires = now + STATUS_CACHE_TTL_SEC
-        return {**status, "cached": False}
+            def call() -> dict:
+                feeder = self._resolve_feeder()
+                food_low = feeder.food_low_status
+                return {
+                    "id": getattr(feeder, "id", None),
+                    "name": getattr(feeder, "name", None),
+                    "battery_level": feeder.battery_level,
+                    "food_low_status": food_low,
+                    "food_state": ["ok", "low", "empty"][food_low],
+                }
+
+            status = await asyncio.to_thread(call)
+            self._status_cache = status
+            self._status_cache_expires = time.time() + STATUS_CACHE_TTL_SEC
+            return {**status, "cached": False}
 
     async def do_command(
         self,
         command: Mapping[str, Any],
         *,
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
         **kwargs: Any,
     ) -> Mapping[str, Any]:
         cmd = command.get("command")
