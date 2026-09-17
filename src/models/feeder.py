@@ -4,7 +4,7 @@ import logging
 import re
 import time
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
@@ -260,7 +260,7 @@ class PetSafeFeeder(Generic):
     async def _process_state(self) -> None:
         assert self._state is not None
         assert self._state_lock is not None
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         async with self._state_lock:
             changed = False
             schedule_changed = False
@@ -438,8 +438,8 @@ class PetSafeFeeder(Generic):
             # Naive input from a browser <input type="datetime-local"> —
             # interpret as local machine time.
             until = until.astimezone()
-        until_utc = until.astimezone(timezone.utc)
-        if until_utc <= datetime.now(timezone.utc):
+        until_utc = until.astimezone(UTC)
+        if until_utc <= datetime.now(UTC):
             raise ValueError("`until` must be in the future")
         async with self._state_lock:
             feeder = await self._resolve_feeder()
@@ -464,7 +464,7 @@ class PetSafeFeeder(Generic):
         delayed_hhmm = delayed_local.strftime("%H:%M")
         restore_at = (
             delayed_local + timedelta(minutes=RESTORE_MARGIN_MIN)
-        ).astimezone(timezone.utc)
+        ).astimezone(UTC)
         async with self._state_lock:
             feeder = await self._resolve_feeder()
             await feeder.modify_schedule(
@@ -499,7 +499,7 @@ class PetSafeFeeder(Generic):
         next_sched, next_fire = found
         restore_at = (
             next_fire + timedelta(minutes=RESTORE_MARGIN_MIN)
-        ).astimezone(timezone.utc)
+        ).astimezone(UTC)
         async with self._state_lock:
             feeder = await self._resolve_feeder()
             await feeder.delete_schedule(next_sched["id"], update_data=False)
@@ -530,7 +530,7 @@ class PetSafeFeeder(Generic):
             amount_cups = next_sched["cups"]
             restore_at = (
                 next_fire + timedelta(minutes=RESTORE_MARGIN_MIN)
-            ).astimezone(timezone.utc)
+            ).astimezone(UTC)
             async with self._state_lock:
                 feeder = await self._resolve_feeder()
                 await feeder.delete_schedule(next_sched["id"], update_data=False)
