@@ -51,13 +51,18 @@ Add a Generic component with model `viam:petsafe:smart-feed`:
       "refresh_token": "...",
       "access_token": "..."
     },
-    "feeder_id": "optional-specific-feeder-id"
+    "feeder_id": "optional-specific-feeder-id",
+    "target_meal_cups": 1
   }
 }
 ```
 
 If `feeder_id` is omitted, the first feeder on the account is used —
 fine if you only have one.
+
+`target_meal_cups` (optional) is the pet's normal meal size in cups.
+Clients use it to default the Feed Now amount and to visually compare
+against scheduled amounts. It's echoed back in `status` responses.
 
 Tokens live inline in the machine config; they're stored in Viam Cloud
 alongside the rest of the config. The refresh token typically lasts
@@ -99,6 +104,9 @@ Response:
   "battery_level": 87,
   "food_low_status": 0,
   "food_state": "ok",
+  "is_paused": false,
+  "is_slow_feed": false,
+  "target_meal_cups": 1,
   "cached": false
 }
 ```
@@ -106,6 +114,43 @@ Response:
 `food_low_status`: `0` = has food, `1` = low, `2` = out.
 
 `cached: true` means you received the cached value (see rate limiting).
+
+### Schedule
+
+```json
+{ "command": "schedule" }
+```
+
+Response:
+```json
+{
+  "schedules": [
+    { "id": "123456", "time": "07:00", "amount_eighths": 8, "cups": 1.0 },
+    { "id": "234567", "time": "18:00", "amount_eighths": 8, "cups": 1.0 }
+  ],
+  "cached": false
+}
+```
+
+Times are 24-hour local. `amount_eighths` is the raw PetSafe unit (1 =
+1/8 cup); `cups` is the same value in cups for convenience. Schedules
+recur daily — there's no date component.
+
+Cached separately from `status` on the same 5-minute TTL.
+
+### Pause schedule
+
+```json
+{ "command": "pause_schedule", "paused": true }
+```
+
+Pauses (or unpauses, with `paused: false`) all scheduled feedings.
+Manual `feed` commands still work while paused.
+
+Response:
+```json
+{ "ok": true, "paused": true }
+```
 
 ## Rate limiting
 
