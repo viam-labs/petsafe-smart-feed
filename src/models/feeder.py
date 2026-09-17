@@ -459,8 +459,13 @@ class PetSafeFeeder(Generic):
         found = _find_next_schedule(schedules, now_local)
         if not found:
             raise RuntimeError("No upcoming scheduled feedings.")
-        next_sched, _ = found
-        delayed_local = now_local + timedelta(hours=hours)
+        next_sched, next_fire = found
+        # Delay = shift the scheduled fire time later by `hours`. Using
+        # `now + hours` here would let a small delay accidentally move
+        # the feeding EARLIER than it was scheduled (e.g. now=3pm,
+        # scheduled=6pm, delay=1h -> 4pm), which is the opposite of
+        # what "delay" means.
+        delayed_local = next_fire + timedelta(hours=hours)
         delayed_hhmm = delayed_local.strftime("%H:%M")
         restore_at = (
             delayed_local + timedelta(minutes=RESTORE_MARGIN_MIN)
