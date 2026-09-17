@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar, Self
@@ -22,6 +23,26 @@ STATUS_CACHE_TTL_SEC = 300
 # The petsafe library counts feed amount in 1/8-cup increments; the
 # smallest possible dispense is 1 (= 1/8 cup).
 EIGHTHS_PER_CUP = 8
+
+_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def _normalize_time(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("`time` must be a string like 'HH:MM'")
+    m = _TIME_RE.match(value)
+    if not m:
+        raise ValueError("`time` must be in HH:MM format")
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h < 24 and 0 <= mi < 60):
+        raise ValueError("`time` values out of range (00:00 through 23:59)")
+    return f"{h:02d}:{mi:02d}"
+
+
+def _cups_to_eighths(value: Any) -> int:
+    if not isinstance(value, int | float) or isinstance(value, bool) or value <= 0:
+        raise ValueError("`cups` must be a positive number")
+    return max(1, round(value * EIGHTHS_PER_CUP))
 
 
 class PetSafeFeeder(Generic):
@@ -194,6 +215,56 @@ class PetSafeFeeder(Generic):
         await feeder.pause_schedules(paused, update_data=False)
         return {"ok": True, "paused": paused}
 
+    async def _add_schedule(self, time_value: Any, cups: Any) -> dict:
+        hhmm = _normalize_time(time_value)
+        eighths = _cups_to_eighths(cups)
+        feeder = await self._resolve_feeder()
+        response = await feeder.schedule_feed(
+            time=hhmm, amount=eighths, update_data=False
+        )
+        self._schedule_cache = None
+        new_id = None
+        if isinstance(response, dict):
+            new_id = response.get("id") or response.get("schedule_id")
+        return {
+            "ok": True,
+            "schedule": {
+                "id": new_id,
+                "time": hhmm,
+                "amount_eighths": eighths,
+                "cups": eighths / EIGHTHS_PER_CUP,
+            },
+        }
+
+    async def _modify_schedule(self, schedule_id: Any, time_value: Any, cups: Any) -> dict:
+        if not isinstance(schedule_id, str) or not schedule_id:
+            raise ValueError("`id` is required")
+        hhmm = _normalize_time(time_value)
+        eighths = _cups_to_eighths(cups)
+        feeder = await self._resolve_feeder()
+        await feeder.modify_schedule(
+            time=hhmm,
+            amount=eighths,
+            schedule_id=schedule_id,
+            update_data=False,
+        )
+        self._schedule_cache = None
+        return {
+            "ok": True,
+            "id": schedule_id,
+            "time": hhmm,
+            "amount_eighths": eighths,
+            "cups": eighths / EIGHTHS_PER_CUP,
+        }
+
+    async def _delete_schedule(self, schedule_id: Any) -> dict:
+        if not isinstance(schedule_id, str) or not schedule_id:
+            raise ValueError("`id` is required")
+        feeder = await self._resolve_feeder()
+        await feeder.delete_schedule(schedule_id, update_data=False)
+        self._schedule_cache = None
+        return {"ok": True, "id": schedule_id}
+
     async def do_command(
         self,
         command: Mapping[str, Any],
@@ -212,6 +283,14 @@ class PetSafeFeeder(Generic):
             return await self._schedule()
         if cmd == "pause_schedule":
             return await self._pause_schedule(bool(command.get("paused")))
+        if cmd == "add_schedule":
+            return await self._add_schedule(command.get("time"), command.get("cups"))
+        if cmd == "modify_schedule":
+            return await self._modify_schedule(
+                command.get("id"), command.get("time"), command.get("cups")
+            )
+        if cmd == "delete_schedule":
+            return await self._delete_schedule(command.get("id"))
         raise ValueError(f"Unknown command: {cmd!r}")
 
 

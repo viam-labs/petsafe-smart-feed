@@ -152,6 +152,45 @@ Response:
 { "ok": true, "paused": true }
 ```
 
+### Add schedule
+
+```json
+{ "command": "add_schedule", "time": "07:00", "cups": 1 }
+```
+
+Creates a new scheduled feeding. `time` is 24-hour local. `cups` is
+rounded to the nearest 1/8 cup (minimum dispense is 0.125).
+
+Response:
+```json
+{
+  "ok": true,
+  "schedule": { "id": "123456", "time": "07:00", "amount_eighths": 8, "cups": 1.0 }
+}
+```
+
+### Modify schedule
+
+```json
+{ "command": "modify_schedule", "id": "123456", "time": "07:30", "cups": 0.5 }
+```
+
+Response:
+```json
+{ "ok": true, "id": "123456", "time": "07:30", "amount_eighths": 4, "cups": 0.5 }
+```
+
+### Delete schedule
+
+```json
+{ "command": "delete_schedule", "id": "123456" }
+```
+
+Response:
+```json
+{ "ok": true, "id": "123456" }
+```
+
 ## Rate limiting
 
 **PetSafe locks your account** if you make data reads more than once
