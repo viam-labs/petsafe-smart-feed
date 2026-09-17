@@ -1,0 +1,15 @@
+{
+    "module_id": "viam:petsafe-smart-feed",
+    "visibility": "public",
+    "url": "https://github.com/viam-labs/petsafe-smart-feed",
+    "description": "Viam module for PetSafe Smart Feed automatic pet feeders.",
+    "models": [
+        {
+            "api": "rdk:component:generic",
+            "model": "viam:petsafe:smart-feed",
+            "markdown_link": "README.md#configuration"
+        }
+    ],
+    "entrypoint": "./run.sh",
+    "first_run": "./setup.sh"
+}

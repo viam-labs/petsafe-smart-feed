@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Explicit version like v0.1.0 (leave empty to bump patch)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build module tarball
+        run: tar -czf module.tar.gz src requirements.txt run.sh setup.sh meta.json
+
+      - name: Compute and push tag
+        id: tag
+        run: |
+          input="${{ github.event.inputs.version }}"
+          if [ -n "$input" ]; then
+            if ! [[ "$input" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Bad version format: $input"; exit 1
+            fi
+            next="$input"
+          else
+            latest=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+            if [ -z "$latest" ]; then
+              next="v0.0.1"
+            else
+              IFS='.' read -r major minor patch <<< "${latest#v}"
+              next="v${major}.${minor}.$((patch + 1))"
+            fi
+          fi
+          echo "Next tag: $next"
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+          echo "version=${next#v}" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$next"
+          git push origin "$next"
+
+      - uses: viamrobotics/upload-module@v1
+        with:
+          module-path: module.tar.gz
+          platform: any
+          version: ${{ steps.tag.outputs.version }}
+          key-id: ${{ secrets.viam_key_id }}
+          key-value: ${{ secrets.viam_key_value }}
