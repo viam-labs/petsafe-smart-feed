@@ -21,17 +21,11 @@ from viam.utils import struct_to_dict
 LOGGER = logging.getLogger(__name__)
 
 # PetSafe locks accounts that read data more than once per 5 minutes.
-# Every read path must go through the cached status method.
 STATUS_CACHE_TTL_SEC = 300
 
-# The petsafe library counts feed amount in 1/8-cup increments; the
-# smallest possible dispense is 1 (= 1/8 cup).
 EIGHTHS_PER_CUP = 8
 
-# PetSafe's slow-feed mode spreads a meal over roughly 15 minutes. If
-# feed_now fires again inside that window we get two overlapping feeds
-# (a very fed dog). Refuse feed_now if last_feeding.created_at is
-# within it.
+# PetSafe's slow-feed mode spreads a meal over roughly 15 minutes.
 SLOW_FEED_WINDOW_MIN = 15
 
 # PetSafe returns schedule ids under different keys across firmware
@@ -51,16 +45,10 @@ def _extract_schedule_id(entry: dict) -> str | None:
 
 DEFAULT_STATE_PATH = "~/.viam/petsafe-smart-feed-state.json"
 
-# How often the background loop wakes to process schedule fires.
-# Local check only — no PetSafe hits unless there's actual work.
 BG_LOOP_INTERVAL_SEC = 60
 
-# If we come up after a schedule's fire time but within this window,
-# fire it late (catch-up). Past this, we log a missed feed and skip.
 CATCH_UP_WINDOW_MIN = 30
 
-# Schema version for the local state file. Bumped when the shape
-# changes in a way that requires a migration.
 SCHEMA_VERSION = 2
 
 _TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
@@ -89,7 +77,7 @@ def _new_id() -> str:
 
 
 def _normalize_days(days: Any) -> list[int]:
-    """Validate + dedupe 0..6 weekdays (Mon..Sun). Empty = every day."""
+    """0..6 = Mon..Sun. Empty = every day."""
     if days is None:
         return []
     if not isinstance(days, list):
@@ -103,7 +91,6 @@ def _normalize_days(days: Any) -> list[int]:
 
 
 def _normalize_schedule(raw: dict) -> dict:
-    """Coerce a schedule dict into canonical shape."""
     if not isinstance(raw, dict):
         raise ValueError("schedule must be an object")
     hhmm = _normalize_time(raw.get("time"))
@@ -138,12 +125,7 @@ def _empty_state() -> dict:
 
 
 def _find_next_schedule(schedules: list, now: datetime) -> tuple | None:
-    """Return (schedule_entry, datetime_when_it_next_fires) or None.
-
-    Considers enabled + days_of_week + delayed_until when computing
-    the next fire moment. Used by delay_next / skip_next verbs to
-    identify "the one coming up".
-    """
+    """Return (schedule_entry, datetime_when_it_next_fires) or None."""
     best_dt = None
     best_sched = None
     for s in schedules or []:
@@ -157,7 +139,6 @@ def _find_next_schedule(schedules: list, now: datetime) -> tuple | None:
         except ValueError:
             continue
         dows = s.get("days_of_week") or []
-        # If delayed_until is set and in the future, that's the next fire.
         delayed = s.get("delayed_until")
         if delayed:
             try:
@@ -170,8 +151,6 @@ def _find_next_schedule(schedules: list, now: datetime) -> tuple | None:
                     continue
             except ValueError:
                 pass
-        # Otherwise walk forward up to 7 days looking for the next
-        # match on time-of-day + day-of-week.
         for offset in range(0, 8):
             candidate = (now + timedelta(days=offset)).replace(
                 hour=h, minute=mi, second=0, microsecond=0
@@ -262,7 +241,6 @@ class PetSafeFeeder(Generic):
         self.state_path = str(attrs.get("state_path") or DEFAULT_STATE_PATH)
         catch_up = attrs.get("catch_up_within_min")
         self.catch_up_within_min = int(catch_up) if catch_up is not None else CATCH_UP_WINDOW_MIN
-        # Bust caches so token or feeder changes take effect immediately.
         self._client = None
         self._feeder = None
         self._feeder_data_fresh = False
@@ -280,8 +258,6 @@ class PetSafeFeeder(Generic):
         try:
             self._bg_task = asyncio.create_task(self._bg_loop())
         except RuntimeError:
-            # No running event loop yet — the module server will call
-            # reconfigure again once the loop is up.
             self._bg_task = None
 
     def _get_client(self) -> sf.PetSafeClient:
@@ -329,8 +305,6 @@ class PetSafeFeeder(Generic):
             return _empty_state()
         if not isinstance(loaded, dict):
             return _empty_state()
-        # Preserve everything we recognize; anything older will get
-        # wiped by the migration path.
         merged = _empty_state()
         if isinstance(loaded.get("schedules"), list):
             valid = []
@@ -345,7 +319,6 @@ class PetSafeFeeder(Generic):
         if loaded.get("schema_version") == SCHEMA_VERSION:
             merged["schema_version"] = SCHEMA_VERSION
         else:
-            # Force migration on next tick.
             merged["schema_version"] = None
         return merged
 
@@ -368,18 +341,11 @@ class PetSafeFeeder(Generic):
     # Migration + background loop
 
     async def _migrate_if_needed(self) -> None:
-        """Delete any legacy PetSafe schedules and stamp schema_version=2.
-
-        We take ownership of scheduling on the Pi. Anything PetSafe's
-        cloud is still configured to fire would double up with our
-        own fires, so wipe them once. This is a no-op if migration has
-        already run (schema_version == 2 in the state file).
-        """
+        """Delete pre-v2 PetSafe cloud schedules and stamp schema_version."""
         if self._migrated:
             return
         assert self._state is not None
         assert self._state_lock is not None
-        LOGGER.info("running Pi-owned scheduling migration")
         try:
             feeder = await self._resolve_feeder()
             existing = await feeder.get_schedules()
@@ -390,17 +356,14 @@ class PetSafeFeeder(Generic):
                 try:
                     await feeder.delete_schedule(sid, update_data=False)
                 except Exception as e:
-                    LOGGER.warning("failed to delete legacy PetSafe schedule %s: %s", sid, e)
+                    LOGGER.warning("failed to delete PetSafe schedule %s: %s", sid, e)
         except Exception as e:
-            # If we can't reach PetSafe right now, don't mark migrated.
-            # The bg loop will try again next tick.
-            LOGGER.warning("migration deferred, could not reach PetSafe: %s", e)
+            LOGGER.warning("migration deferred: %s", e)
             return
         async with self._state_lock:
             self._state["schema_version"] = SCHEMA_VERSION
             self._save_state()
         self._migrated = True
-        LOGGER.info("migration complete; local state is now source of truth")
 
     async def _bg_loop(self) -> None:
         while True:
@@ -415,19 +378,16 @@ class PetSafeFeeder(Generic):
             await asyncio.sleep(BG_LOOP_INTERVAL_SEC)
 
     async def _tick(self) -> None:
-        """Fire any schedules whose moment has arrived."""
         assert self._state is not None
         assert self._state_lock is not None
         now_local = datetime.now().astimezone()
 
-        # Honor pause_until: if we're inside a paused window, no fires.
         pause_until_iso = (self._state or {}).get("pause_until")
         if pause_until_iso:
             try:
                 pu = datetime.fromisoformat(pause_until_iso)
                 if now_local.astimezone(UTC) < pu.astimezone(UTC):
                     return
-                # Expired — clear it.
                 async with self._state_lock:
                     self._state["pause_until"] = None
                     self._save_state()
@@ -448,10 +408,6 @@ class PetSafeFeeder(Generic):
                 self._save_state()
 
     async def _process_schedule(self, schedule: dict, now_local: datetime) -> bool:
-        """Fire the schedule if due. Returns True if the schedule was
-        modified (fired, skipped, or the delayed_until cleared).
-        """
-        # Delayed override: one-shot fire at delayed_until, then clear.
         delayed_iso = schedule.get("delayed_until")
         if delayed_iso:
             try:
@@ -461,7 +417,6 @@ class PetSafeFeeder(Generic):
                 return True
             if now_local < delayed_at:
                 return False
-            # Fire now (respecting enabled + skip_next_fire).
             fired_at_iso = datetime.now(UTC).isoformat()
             schedule["delayed_until"] = None
             schedule["last_processed_at"] = fired_at_iso
@@ -489,7 +444,6 @@ class PetSafeFeeder(Generic):
         if dows and now_local.weekday() not in dows:
             return False
 
-        # Already handled today?
         last_proc_iso = schedule.get("last_processed_at")
         if last_proc_iso:
             try:
@@ -499,8 +453,6 @@ class PetSafeFeeder(Generic):
             except ValueError:
                 pass
 
-        # Missed feed — past catch-up window. Log + mark processed
-        # so we don't try again forever. No dispense.
         age = (now_local - today_fire).total_seconds() / 60
         if age > self.catch_up_within_min:
             LOGGER.warning(
@@ -510,17 +462,15 @@ class PetSafeFeeder(Generic):
             schedule["last_processed_at"] = today_fire.astimezone(UTC).isoformat()
             return True
 
-        # Skip flag — treat as fired, dispense nothing.
         if schedule.get("skip_next_fire", False):
             LOGGER.info(
-                "skipping feed for schedule %s at %s (skip_next_fire)",
+                "skipping feed for schedule %s at %s",
                 schedule.get("id"), today_fire.isoformat(),
             )
             schedule["last_processed_at"] = today_fire.astimezone(UTC).isoformat()
             schedule["skip_next_fire"] = False
             return True
 
-        # Fire.
         fired_at_iso = datetime.now(UTC).isoformat()
         await self._feed(schedule["cups"], slow=None)
         schedule["last_processed_at"] = fired_at_iso
@@ -564,7 +514,6 @@ class PetSafeFeeder(Generic):
         }
 
     async def _schedule(self) -> dict:
-        """Return the local schedule list (source of truth in v2)."""
         return {
             "schedules": list((self._state or {}).get("schedules", [])),
             "cached": False,
@@ -596,10 +545,8 @@ class PetSafeFeeder(Generic):
     async def _feed(self, cups: float, slow: bool | None = None) -> dict:
         eighths = max(1, round(cups * EIGHTHS_PER_CUP))
         feeder = await self._resolve_feeder()
-        # slow=None → petsafe SDK falls back to the feeder's own
-        # slow_feed setting. Passing False forces fast regardless.
-        # update_data=False so we don't burn a read call after every
-        # feed; the status cache TTL is what decides when to refresh.
+        # slow=None defers to the feeder's own slow_feed setting.
+        # update_data=False so we don't burn a status read after each feed.
         await feeder.feed(amount=eighths, slow_feed=slow, update_data=False)
         return {"ok": True, "cups": eighths / EIGHTHS_PER_CUP, "slow": slow}
 
@@ -612,8 +559,6 @@ class PetSafeFeeder(Generic):
                 "config to enable feed_now."
             )
 
-        # Refuse if last_feeding.created_at is within the slow-feed
-        # window — a feed is likely still dispensing.
         window = timedelta(minutes=SLOW_FEED_WINDOW_MIN)
         last_feeding = (await self._last_feeding()).get("last_feeding") or {}
         last_ts_raw = last_feeding.get("created_at")
@@ -630,17 +575,10 @@ class PetSafeFeeder(Generic):
             except ValueError:
                 pass
 
-        # slow=None → honor the feeder's own slow_feed setting.
         await self._feed(self.target_meal_cups, slow=None)
         return {"ok": True, "fed_cups": self.target_meal_cups}
 
     async def _pause_schedule(self, paused: bool) -> dict:
-        """Legacy toggle: pause/unpause all schedules.
-
-        In v2, "paused" is expressed as pause_until far in the future
-        (year 2100) so a single field carries both "paused indefinitely"
-        and "paused until X".
-        """
         assert self._state is not None
         assert self._state_lock is not None
         async with self._state_lock:
@@ -671,7 +609,6 @@ class PetSafeFeeder(Generic):
         return {"ok": True, "pause_until": until_utc.isoformat()}
 
     async def _delay_next(self, hours: Any) -> dict:
-        """Shift the next-scheduled fire by `hours` (positive or negative)."""
         assert self._state is not None
         assert self._state_lock is not None
         if not isinstance(hours, int | float) or isinstance(hours, bool) or hours == 0:
@@ -747,7 +684,6 @@ class PetSafeFeeder(Generic):
                     merged[k] = v
             normalized = _normalize_schedule(merged)
             normalized["id"] = existing["id"]
-            # Preserve internal bookkeeping fields unless explicitly changed.
             for k in ("last_processed_at", "last_fired_at"):
                 if k not in payload:
                     normalized[k] = existing.get(k)

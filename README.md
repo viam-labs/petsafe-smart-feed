@@ -12,30 +12,10 @@ Tested against the PetSafe Smart Feed 2nd generation (PFD00-16828). The
 underlying library also supports ScoopFree and Smart Door devices;
 this module currently exposes only the feeder.
 
-## Architecture
-
-**Scheduling lives on the Pi**, not in PetSafe's cloud. The module
-holds an ordered list of schedules in a local state file. A background
-loop wakes every minute and fires schedules whose time has arrived,
-using PetSafe's ad-hoc `feed()` API (the same one manual "Feed Now"
-uses) to dispense.
-
-This is a deliberate departure from the earlier design (which stored
-schedules on PetSafe's cloud and let PetSafe fire them). Reasons:
-
-- **Full visibility.** Missed fires are logged and surfaced in `status`
-  rather than silently vanishing.
-- **Days-of-week.** PetSafe's cloud schedules are time-only; days-of-week
-  requires local logic.
-- **Editable skip / delay.** Skipping or delaying a schedule flips a
-  flag on the schedule itself; the schedule stays visible and editable
-  in the dashboard. No hidden auto-restore state you can't cancel.
-- **Retry.** Transient PetSafe API failures at fire time are retried
-  next tick.
-
-Trade-off: if the Pi is offline at a scheduled fire time, that meal is
-missed (up to the catch-up window). Configure alerts on the dashboard's
-"missed feeds" status field.
+Schedules are stored in a local state file on the Pi. A background
+loop ticks once a minute and fires schedules whose time has arrived,
+using PetSafe's ad-hoc `feed()` API to dispense. If the Pi is offline
+at a scheduled fire time, the meal is missed (up to `catch_up_within_min`).
 
 ## Prerequisites
 
@@ -92,13 +72,10 @@ below. You can delete the venv when you're done.
 - `state_path` (default `~/.viam/petsafe-smart-feed-state.json`) —
   where schedules and pause state persist.
 
-## Migration from earlier versions
-
 On first boot of v2+, the module deletes any pre-existing schedules
-from PetSafe's cloud (they'd otherwise double-fire alongside our own)
-and stamps the state file with `schema_version: 2`. The list of local
-schedules starts empty. Re-add your schedules through the dashboard
-after the module reports `migrated: true` in `status`.
+from PetSafe's cloud and stamps the state file with `schema_version: 2`.
+Local schedules start empty; re-add through the dashboard once `status`
+reports `migrated: true`.
 
 ## Commands
 
@@ -124,9 +101,7 @@ one call only.
 ```
 
 Dispenses `target_meal_cups` immediately, honoring the feeder's slow-feed
-setting. Refuses if a feed was recorded in the last 15 minutes (assumes
-slow-feed is still dispensing). Does NOT touch schedules — the next
-scheduled fire still happens normally.
+setting. Refuses if a feed was recorded in the last 15 minutes.
 
 ### Status
 
@@ -230,8 +205,7 @@ Disabled schedules don't fire.
 ```
 
 Sets `skip_next_fire: true` on whichever schedule is up next. That
-schedule's next fire is a no-op; the flag then clears. The schedule
-itself stays visible and editable — no hidden deletion.
+schedule's next fire is a no-op; the flag then clears.
 
 Or target a specific schedule:
 
@@ -245,9 +219,8 @@ Or target a specific schedule:
 { "command": "delay_next", "hours": 1 }
 ```
 
-Sets `delayed_until` on the next schedule to fire `hours` later than
-its natural time. Once fired, the delay clears and the schedule
-resumes normal timing.
+Sets `delayed_until` on the next schedule. Fires once at the new
+time, then the flag clears.
 
 ### Pause / resume all schedules
 
@@ -278,9 +251,8 @@ Cached for 5 minutes.
 ## Rate limiting
 
 PetSafe locks your account if you make data reads more than once per
-5 minutes. `status`, `schedule`, and `last_feeding` responses are
-cached for exactly this reason. Write operations (`feed`, and every
-scheduled fire) are not rate-limited.
+5 minutes. Read responses (`status`, `schedule`, `last_feeding`) are
+cached to stay under that limit. Writes are not rate-limited.
 
 ## Development
 
