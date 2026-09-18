@@ -12,6 +12,11 @@ Tested against the PetSafe Smart Feed 2nd generation (PFD00-16828). The
 underlying library also supports ScoopFree and Smart Door devices;
 this module currently exposes only the feeder.
 
+Schedules are stored in a local state file on the Pi. A background
+loop ticks once a minute and fires schedules whose time has arrived,
+using PetSafe's ad-hoc `feed()` API to dispense. If the Pi is offline
+at a scheduled fire time, the meal is missed (up to `catch_up_within_min`).
+
 ## Prerequisites
 
 1. A PetSafe Smart Feed linked to a PetSafe account.
@@ -37,8 +42,6 @@ below. You can delete the venv when you're done.
 
 ## Configuration
 
-Add a Generic component with model `viam:petsafe:smart-feed`:
-
 ```json
 {
   "name": "feeder",
@@ -52,29 +55,27 @@ Add a Generic component with model `viam:petsafe:smart-feed`:
       "access_token": "..."
     },
     "feeder_id": "optional-specific-feeder-id",
-    "target_meal_cups": 1,
+    "target_meal_cups": 1.25,
+    "catch_up_within_min": 30,
     "state_path": "~/.viam/petsafe-smart-feed-state.json"
   }
 }
 ```
 
-If `feeder_id` is omitted, the first feeder on the account is used —
-fine if you only have one.
+- `feeder_id` — optional. Omit if you only have one feeder on the
+  account (module picks the first).
+- `target_meal_cups` — required for `feed_now`; the module dispenses
+  this amount when the button is hit.
+- `catch_up_within_min` (default 30) — after a scheduled fire time, how
+  many minutes late we'll still fire the meal. Past that, we log a
+  missed feed and move on.
+- `state_path` (default `~/.viam/petsafe-smart-feed-state.json`) —
+  where schedules and pause state persist.
 
-`target_meal_cups` (optional) is the pet's normal meal size in cups.
-Clients use it to default the Feed Now amount and to visually compare
-against scheduled amounts. It's echoed back in `status` responses.
-
-`state_path` (optional, default `~/.viam/petsafe-smart-feed-state.json`)
-is where the module stores pending auto-restore state for `pause_until`,
-`delay_next`, `skip_next`, and `feed_now`. See "Auto-restore" below.
-
-Tokens live inline in the machine config; they're stored in Viam Cloud
-alongside the rest of the config. The refresh token typically lasts
-~30 days, at which point you'll need to re-run the token dance and
-update the config. Access tokens are refreshed in memory during
-runtime but are not persisted back to config, so the original tokens
-you paste in are what's used every time the module restarts.
+On first boot of v2+, the module deletes any pre-existing schedules
+from PetSafe's cloud and stamps the state file with `schema_version: 2`.
+Local schedules start empty; re-add through the dashboard once `status`
+reports `migrated: true`.
 
 ## Commands
 
@@ -87,202 +88,11 @@ All commands are dispatched via `do_command`.
 ```
 
 `cups` is in cup units. PetSafe internally rounds to 1/8-cup increments;
-the smallest possible dispense is 0.125 cups. `slow` is optional and
-defaults to `false`.
+the smallest possible dispense is 0.125 cups.
 
-Response:
-```json
-{ "ok": true, "cups": 0.5, "slow": false }
-```
-
-### Status
-
-```json
-{ "command": "status" }
-```
-
-Response:
-```json
-{
-  "id": "PFD00-...",
-  "name": "Kitchen Feeder",
-  "battery_level": 87,
-  "food_low_status": 0,
-  "food_state": "ok",
-  "is_paused": false,
-  "is_slow_feed": false,
-  "target_meal_cups": 1,
-  "cached": false
-}
-```
-
-`food_low_status`: `0` = has food, `1` = low, `2` = out.
-
-`cached: true` means you received the cached value (see rate limiting).
-
-### Schedule
-
-```json
-{ "command": "schedule" }
-```
-
-Response:
-```json
-{
-  "schedules": [
-    { "id": "123456", "time": "07:00", "amount_eighths": 8, "cups": 1.0 },
-    { "id": "234567", "time": "18:00", "amount_eighths": 8, "cups": 1.0 }
-  ],
-  "cached": false
-}
-```
-
-Times are 24-hour local. `amount_eighths` is the raw PetSafe unit (1 =
-1/8 cup); `cups` is the same value in cups for convenience. Schedules
-recur daily — there's no date component.
-
-Cached separately from `status` on the same 5-minute TTL.
-
-### Last feeding
-
-```json
-{ "command": "last_feeding" }
-```
-
-Returns the most recent `FEED_DONE` event from PetSafe's message log
-for the feeder (last 7 days).
-
-Response:
-```json
-{
-  "last_feeding": {
-    "message_type": "FEED_DONE",
-    "created_at": "2026-09-17T18:00:00Z",
-    "payload": { "amount": 8 }
-  },
-  "cached": false
-}
-```
-
-`last_feeding` is `null` if no feeding was found in the past 7 days.
-Cached for 5 minutes.
-
-### Pause schedule
-
-```json
-{ "command": "pause_schedule", "paused": true }
-```
-
-Pauses (or unpauses, with `paused: false`) all scheduled feedings.
-Manual `feed` commands still work while paused.
-
-Response:
-```json
-{ "ok": true, "paused": true }
-```
-
-### Add schedule
-
-```json
-{ "command": "add_schedule", "time": "07:00", "cups": 1 }
-```
-
-Creates a new scheduled feeding. `time` is 24-hour local. `cups` is
-rounded to the nearest 1/8 cup (minimum dispense is 0.125).
-
-Response:
-```json
-{
-  "ok": true,
-  "schedule": { "id": "123456", "time": "07:00", "amount_eighths": 8, "cups": 1.0 }
-}
-```
-
-### Modify schedule
-
-```json
-{ "command": "modify_schedule", "id": "123456", "time": "07:30", "cups": 0.5 }
-```
-
-Response:
-```json
-{ "ok": true, "id": "123456", "time": "07:30", "amount_eighths": 4, "cups": 0.5 }
-```
-
-### Delete schedule
-
-```json
-{ "command": "delete_schedule", "id": "123456" }
-```
-
-Response:
-```json
-{ "ok": true, "id": "123456" }
-```
-
-### Pause until
-
-```json
-{ "command": "pause_until", "until": "2026-09-25T12:00:00" }
-```
-
-Pauses all scheduled feedings and records a wake time in the state
-file. A background loop wakes every minute and unpauses schedules
-once the wake time has passed — even if the app is never opened.
-Naive datetimes are interpreted as machine local time; ISO strings
-with a timezone (e.g. `...+00:00`) are honored as-is.
-
-Response:
-```json
-{ "ok": true, "pause_until": "2026-09-25T16:00:00+00:00" }
-```
-
-A manual `pause_schedule` with `paused: false` clears any pending
-`pause_until`.
-
-### Delay next
-
-```json
-{ "command": "delay_next", "hours": 1 }
-```
-
-Finds the next upcoming scheduled feeding (spanning to tomorrow if
-none remain today) and shifts its time by `hours` — positive delays,
-negative moves earlier. Records an auto-restore in the state file so
-the background loop puts the original time back after the moved
-firing completes (plus a 15-minute margin). Rejects a value that
-would put the resulting time in the past.
-
-Response:
-```json
-{
-  "ok": true,
-  "schedule_id": "123456",
-  "moved_to": "20:30",
-  "restore_at": "2026-09-17T20:45:00+00:00"
-}
-```
-
-### Skip next
-
-```json
-{ "command": "skip_next" }
-```
-
-Deletes the next upcoming scheduled feeding and records an
-auto-restore. The background loop re-adds the entry with the
-original time and amount after its "would-have-fired" moment plus
-the restore margin.
-
-Response:
-```json
-{
-  "ok": true,
-  "skipped_time": "18:00",
-  "skipped_cups": 1.0,
-  "restore_at": "2026-09-17T18:15:00+00:00"
-}
-```
+`slow` is optional. Omit it (or pass `null`) to defer to the feeder's
+own `slow_feed` setting. Pass `true` or `false` to override for this
+one call only.
 
 ### Feed now
 
@@ -290,52 +100,159 @@ Response:
 { "command": "feed_now" }
 ```
 
-Composite action: feeds the pet with the next scheduled meal's
-amount **and** skips that scheduled entry (auto-restored later).
-Falls back to `target_meal_cups` from config if no upcoming
-schedule exists.
+Dispenses `target_meal_cups` immediately, honoring the feeder's slow-feed
+setting. Refuses if a feed was recorded in the last 15 minutes.
 
-Response:
+### Status
+
+```json
+{ "command": "status" }
+```
+
+Response includes the feeder state plus the local schedule list and
+pause state:
+
 ```json
 {
-  "ok": true,
-  "fed_cups": 1.0,
-  "skip": {
-    "original_time": "18:00",
-    "restore_at": "2026-09-17T18:15:00+00:00"
+  "food_state": 0,
+  "food_low_status": 0,
+  "battery_pct": 87,
+  "is_connected": true,
+  "target_meal_cups": 1.25,
+  "is_slow_feed": true,
+  "paused": false,
+  "schedules": [ ... ],
+  "pause_until": null,
+  "migrated": true,
+  "cached": false
+}
+```
+
+### Schedule list
+
+```json
+{ "command": "schedule" }
+```
+
+Returns the local schedule list:
+
+```json
+{
+  "schedules": [
+    {
+      "id": "a1b2c3d4",
+      "name": "Breakfast",
+      "time": "07:00",
+      "cups": 1.25,
+      "days_of_week": [0, 1, 2, 3, 4],
+      "enabled": true,
+      "skip_next_fire": false,
+      "delayed_until": null,
+      "last_processed_at": "2026-09-18T11:00:03+00:00",
+      "last_fired_at": "2026-09-18T11:00:03+00:00"
+    }
+  ]
+}
+```
+
+### Add schedule
+
+```json
+{
+  "command": "add_schedule",
+  "schedule": {
+    "name": "Breakfast",
+    "time": "07:00",
+    "cups": 1.25,
+    "days_of_week": [0, 1, 2, 3, 4],
+    "enabled": true
   }
 }
 ```
 
-## Auto-restore state
+`days_of_week` is a list of integers 0..6 (Mon..Sun). Empty or omitted
+= every day.
 
-Time-triggered commands (`pause_until`, `delay_next`, `skip_next`,
-`feed_now`) modify the schedule on PetSafe's side and record a
-pending "put it back" action in `state_path` (default
-`~/.viam/petsafe-smart-feed-state.json`).
+### Modify schedule
 
-A background loop wakes every 60 seconds and processes any expired
-entries. Idle ticks make zero PetSafe calls — the loop only reaches
-PetSafe when it actually has work to do. Any failed restore is
-retried on the next tick, so a transient PetSafe outage doesn't
-leave the schedule permanently modified.
+```json
+{
+  "command": "modify_schedule",
+  "schedule": { "id": "a1b2c3d4", "cups": 1.5 }
+}
+```
 
-If the machine is off during a restore window, the entry stays
-pending — the loop restores it on the first tick after the machine
-boots.
+Any subset of fields; missing ones are preserved.
 
-`status` responses include a snapshot of the current state:
-`pause_until`, `delayed_schedule_ids`, `skipped_count`.
+### Delete schedule
+
+```json
+{ "command": "delete_schedule", "id": "a1b2c3d4" }
+```
+
+### Enable / disable a schedule
+
+```json
+{ "command": "set_schedule_enabled", "id": "a1b2c3d4", "enabled": false }
+```
+
+Disabled schedules don't fire.
+
+### Skip the next fire
+
+```json
+{ "command": "skip_next" }
+```
+
+Sets `skip_next_fire: true` on whichever schedule is up next. That
+schedule's next fire is a no-op; the flag then clears.
+
+Or target a specific schedule:
+
+```json
+{ "command": "set_skip_next", "id": "a1b2c3d4", "skip": true }
+```
+
+### Delay the next fire
+
+```json
+{ "command": "delay_next", "hours": 1 }
+```
+
+Sets `delayed_until` on the next schedule. Fires once at the new
+time, then the flag clears.
+
+### Pause / resume all schedules
+
+```json
+{ "command": "pause_schedule", "paused": true }
+```
+
+Global pause. No schedules fire while paused. `feed_now` still works.
+
+### Pause until
+
+```json
+{ "command": "pause_until", "until": "2026-09-25T12:00:00" }
+```
+
+Naive datetimes are interpreted as machine local time. The background
+loop clears the pause automatically once the time passes.
+
+### Last feeding
+
+```json
+{ "command": "last_feeding" }
+```
+
+Returns the most recent `FEED_DONE` event from PetSafe's message log.
+Cached for 5 minutes.
 
 ## Rate limiting
 
-**PetSafe locks your account** if you make data reads more than once
-per 5 minutes. `status` responses are cached for exactly this reason.
-Do not shorten the cache TTL. Do not poll `status` from clients in a
-tight loop; the module already refuses to hit the API more than once
-per 5 minutes and will return cached data instead.
-
-Write operations (`feed`) are not rate-limited.
+PetSafe locks your account if you make data reads more than once per
+5 minutes. Read responses (`status`, `schedule`, `last_feeding`) are
+cached to stay under that limit. Writes are not rate-limited.
 
 ## Development
 
@@ -349,5 +266,4 @@ make module          # build module.tar.gz for upload
 
 `main` auto-releases: every merge to `main` bumps the patch version
 (`v0.0.N` → `v0.0.N+1`), tags the commit, and uploads the tarball to
-the Viam module registry. For a manual minor or major bump, use the
-`workflow_dispatch` input on the Release workflow.
+the Viam module registry.
