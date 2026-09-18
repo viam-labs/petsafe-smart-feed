@@ -27,6 +27,12 @@ STATUS_CACHE_TTL_SEC = 300
 # smallest possible dispense is 1 (= 1/8 cup).
 EIGHTHS_PER_CUP = 8
 
+# PetSafe's slow-feed mode spreads a meal over roughly 15 minutes. If
+# feed_now fires again inside that window we get two overlapping feeds
+# (a very fed dog). Refuse feed_now if a schedule fired inside this
+# window, OR if last_feeding.created_at is within it.
+SLOW_FEED_WINDOW_MIN = 15
+
 # PetSafe has used a few different keys for the schedule id across
 # firmware / API versions. Check them in order — first non-empty wins.
 _SCHEDULE_ID_KEYS = ("id", "schedule_id", "_id", "scheduleId", "feedingId")
@@ -70,6 +76,29 @@ def _cups_to_eighths(value: Any) -> int:
     if not isinstance(value, int | float) or isinstance(value, bool) or value <= 0:
         raise ValueError("`cups` must be a positive number")
     return max(1, round(value * EIGHTHS_PER_CUP))
+
+
+def _find_recently_fired(schedules: list, now: datetime, window: timedelta) -> dict | None:
+    """Return a schedule whose most recent fire time falls in [now - window, now].
+
+    Used before feed_now to guess whether a scheduled feed is currently
+    dispensing so we don't stack a second feed on top of it.
+    """
+    threshold = now - window
+    for s in schedules or []:
+        t = s.get("time") or ""
+        if ":" not in t:
+            continue
+        try:
+            h, mi = map(int, t.split(":"))
+        except ValueError:
+            continue
+        today = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+        # Also consider yesterday's fire in case we're just past midnight.
+        for candidate in (today, today - timedelta(days=1)):
+            if threshold <= candidate <= now:
+                return s
+    return None
 
 
 def _find_next_schedule(schedules: list, now: datetime) -> tuple | None:
@@ -449,9 +478,12 @@ class PetSafeFeeder(Generic):
     # ------------------------------------------------------------------
     # Writes
 
-    async def _feed(self, cups: float, slow: bool) -> dict:
+    async def _feed(self, cups: float, slow: bool | None = None) -> dict:
         eighths = max(1, round(cups * EIGHTHS_PER_CUP))
         feeder = await self._resolve_feeder()
+        # slow=None → petsafe SDK falls back to the feeder's own
+        # slow_feed setting. Passing False (as we used to) forced fast
+        # regardless of what the feeder is configured for.
         # update_data=False so we don't burn a read call after every
         # feed; the status cache TTL is what decides when to refresh.
         await feeder.feed(amount=eighths, slow_feed=slow, update_data=False)
@@ -599,6 +631,35 @@ class PetSafeFeeder(Generic):
         schedule_result = await self._schedule()
         schedules = schedule_result["schedules"]
         now_local = datetime.now().astimezone()
+
+        # Refuse if a feed is likely still in progress (from a scheduled
+        # fire, from the PetSafe app, from a previous feed_now, or
+        # anywhere else the feeder motor is currently active). Two
+        # checks: any schedule whose fire time falls in the slow-feed
+        # window, and last_feeding.created_at within the window.
+        window = timedelta(minutes=SLOW_FEED_WINDOW_MIN)
+        recent_sched = _find_recently_fired(schedules, now_local, window)
+        if recent_sched is not None:
+            raise RuntimeError(
+                f"Schedule at {recent_sched.get('time')} fired within the last "
+                f"{SLOW_FEED_WINDOW_MIN} minutes; refusing feed_now to avoid a "
+                "double feed. Try again once slow-feed finishes."
+            )
+        last_feeding = (await self._last_feeding()).get("last_feeding") or {}
+        last_ts_raw = last_feeding.get("created_at")
+        if isinstance(last_ts_raw, str):
+            try:
+                last_ts = datetime.fromisoformat(last_ts_raw.replace("Z", "+00:00"))
+                age = datetime.now(UTC) - last_ts.astimezone(UTC)
+                if age < window:
+                    raise RuntimeError(
+                        f"Last feeding recorded {int(age.total_seconds() / 60)} "
+                        f"min ago; refusing feed_now inside the "
+                        f"{SLOW_FEED_WINDOW_MIN}-min slow-feed window."
+                    )
+            except ValueError:
+                pass
+
         found = _find_next_schedule(schedules, now_local)
         skip_info = None
         if found:
@@ -627,7 +688,10 @@ class PetSafeFeeder(Generic):
                     "No upcoming schedule to substitute and `target_meal_cups` is not configured."
                 )
             amount_cups = self.target_meal_cups
-        await self._feed(amount_cups, slow=False)
+        # slow=None → honor the feeder's own slow_feed setting instead
+        # of forcing fast. Users who set the feeder to slow expect
+        # feed_now to respect that.
+        await self._feed(amount_cups, slow=None)
         return {"ok": True, "fed_cups": amount_cups, "skip": skip_info}
 
     async def _add_schedule(self, time_value: Any, cups: Any) -> dict:
@@ -704,7 +768,8 @@ class PetSafeFeeder(Generic):
         cmd = command.get("command")
         if cmd == "feed":
             cups = float(command.get("cups", 1 / EIGHTHS_PER_CUP))
-            slow = bool(command.get("slow", False))
+            slow_raw = command.get("slow")
+            slow = bool(slow_raw) if slow_raw is not None else None
             return await self._feed(cups, slow)
         if cmd == "status":
             return await self._status()
