@@ -495,7 +495,9 @@ class PetSafeFeeder(Generic):
                 "food_state": feeder.food_low_status,
                 "food_low_status": feeder.food_low_status,
                 "battery_pct": feeder.battery_level,
-                "is_connected": feeder.is_online,
+                # petsafe-api's DeviceSmartFeed does not expose `is_online`;
+                # tolerate its absence so a status probe doesn't AttributeError.
+                "is_connected": getattr(feeder, "is_online", None),
                 "target_meal_cups": self.target_meal_cups,
                 "is_slow_feed": feeder.is_slow_feed,
                 "paused": feeder.is_paused,
