@@ -11,6 +11,7 @@ from typing import Any, ClassVar, Self
 
 import petsafe as sf
 from viam.components.generic import Generic
+from viam.components.sensor import Sensor
 from viam.proto.app.robot import ComponentConfig
 from viam.proto.common import ResourceName
 from viam.resource.base import ResourceBase
@@ -205,6 +206,8 @@ class PetSafeFeeder(Generic):
     _state_lock: asyncio.Lock | None = None
     _bg_task: asyncio.Task | None = None
     _migrated: bool = False
+    _events_sensor: Any = None
+    _events_sensor_name: str = ""
 
     @classmethod
     def new(
@@ -238,6 +241,11 @@ class PetSafeFeeder(Generic):
             not isinstance(catch_up, int) or isinstance(catch_up, bool) or catch_up < 0
         ):
             raise ValueError("`catch_up_within_min` must be a non-negative integer")
+        events_sensor = attrs.get("events_sensor")
+        if events_sensor is not None:
+            if not isinstance(events_sensor, str) or not events_sensor:
+                raise ValueError("`events_sensor` must be a non-empty string")
+            return [events_sensor]
         return []
 
     def reconfigure(
@@ -254,6 +262,20 @@ class PetSafeFeeder(Generic):
         self.state_path = str(attrs.get("state_path") or DEFAULT_STATE_PATH)
         catch_up = attrs.get("catch_up_within_min")
         self.catch_up_within_min = int(catch_up) if catch_up is not None else CATCH_UP_WINDOW_MIN
+
+        self._events_sensor_name = str(attrs.get("events_sensor") or "")
+        self._events_sensor = None
+        if self._events_sensor_name:
+            for name, resource in dependencies.items():
+                if name.name == self._events_sensor_name and isinstance(resource, Sensor):
+                    self._events_sensor = resource
+                    break
+            if self._events_sensor is None:
+                LOGGER.warning(
+                    "events_sensor %r not found among dependencies; events will not be pushed",
+                    self._events_sensor_name,
+                )
+
         self._client = None
         self._feeder = None
         self._feeder_data_fresh = False
@@ -434,7 +456,12 @@ class PetSafeFeeder(Generic):
             schedule["delayed_until"] = None
             schedule["last_processed_at"] = fired_at_iso
             if schedule.get("enabled", True) and not schedule.get("skip_next_fire", False):
-                await self._feed(schedule["cups"], slow=None)
+                await self._feed(
+                    schedule["cups"],
+                    slow=None,
+                    cause="scheduled",
+                    schedule_id=schedule.get("id"),
+                )
                 schedule["last_fired_at"] = fired_at_iso
             schedule["skip_next_fire"] = False
             return True
@@ -485,7 +512,12 @@ class PetSafeFeeder(Generic):
             return True
 
         fired_at_iso = datetime.now(UTC).isoformat()
-        await self._feed(schedule["cups"], slow=None)
+        await self._feed(
+            schedule["cups"],
+            slow=None,
+            cause="scheduled",
+            schedule_id=schedule.get("id"),
+        )
         schedule["last_processed_at"] = fired_at_iso
         schedule["last_fired_at"] = fired_at_iso
         return True
@@ -557,13 +589,41 @@ class PetSafeFeeder(Generic):
     # ------------------------------------------------------------------
     # Writes
 
-    async def _feed(self, cups: float, slow: bool | None = None) -> dict:
+    async def _feed(
+        self,
+        cups: float,
+        slow: bool | None = None,
+        *,
+        cause: str = "manual",
+        schedule_id: str | None = None,
+    ) -> dict:
         eighths = max(1, round(cups * EIGHTHS_PER_CUP))
         feeder = await self._resolve_feeder()
         # slow=None defers to the feeder's own slow_feed setting.
         # update_data=False so we don't burn a status read after each feed.
         await feeder.feed(amount=eighths, slow_feed=slow, update_data=False)
-        return {"ok": True, "cups": eighths / EIGHTHS_PER_CUP, "slow": slow}
+        fed_cups = eighths / EIGHTHS_PER_CUP
+        event: dict[str, Any] = {
+            "event_type": "feed_dispensed",
+            "source": self.name,
+            "at": datetime.now(UTC).isoformat(),
+            "cups": fed_cups,
+            "cause": cause,
+        }
+        if schedule_id is not None:
+            event["schedule_id"] = schedule_id
+        if slow is not None:
+            event["slow"] = slow
+        await self._push_event(event)
+        return {"ok": True, "cups": fed_cups, "slow": slow}
+
+    async def _push_event(self, event: dict) -> None:
+        if self._events_sensor is None:
+            return
+        try:
+            await self._events_sensor.do_command({"command": "push_event", "event": event})
+        except Exception as e:
+            LOGGER.warning("push_event failed: %s", e)
 
     async def _feed_now(self) -> dict:
         assert self._state is not None
