@@ -10,7 +10,7 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
-    "viam-sdk>=0.30",
+    "viam-sdk>=0.82",
     "petsafe-api>=2.0",
 ]
 
