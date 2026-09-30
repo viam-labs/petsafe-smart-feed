@@ -1,2 +1,2 @@
-viam-sdk>=0.82
+viam-sdk>=0.83
 petsafe-api>=2.0
