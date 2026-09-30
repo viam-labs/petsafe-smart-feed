@@ -4,6 +4,7 @@ import logging
 import re
 import time
 import uuid
+from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -47,6 +48,8 @@ def _extract_schedule_id(entry: dict) -> str | None:
 DEFAULT_STATE_PATH = "~/.viam/petsafe-smart-feed-state.json"
 
 BG_LOOP_INTERVAL_SEC = 60
+
+FEED_HISTORY_MAX = 200
 
 CATCH_UP_WINDOW_MIN = 30
 
@@ -208,6 +211,10 @@ class PetSafeFeeder(Generic):
     _migrated: bool = False
     _events_sensor: Any = None
     _events_sensor_name: str = ""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self._feed_history: deque[dict] = deque(maxlen=FEED_HISTORY_MAX)
 
     @classmethod
     def new(
@@ -614,6 +621,7 @@ class PetSafeFeeder(Generic):
             event["schedule_id"] = schedule_id
         if slow is not None:
             event["slow"] = slow
+        self._feed_history.append(event)
         await self._push_event(event)
         return {"ok": True, "cups": fed_cups, "slow": slow}
 
@@ -854,6 +862,8 @@ class PetSafeFeeder(Generic):
             return await self._set_schedule_enabled(command)
         if cmd == "set_skip_next":
             return await self._set_skip_next(command)
+        if cmd == "get_history":
+            return {"history": list(self._feed_history)}
         raise ValueError(f"Unknown command: {cmd!r}")
 
 
