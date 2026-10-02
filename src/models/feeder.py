@@ -30,6 +30,11 @@ EIGHTHS_PER_CUP = 8
 # PetSafe's slow-feed mode spreads a meal over roughly 15 minutes.
 SLOW_FEED_WINDOW_MIN = 15
 
+# Hard local floor on time between any two feeds. Independent of
+# PetSafe's `last_feeding` field, which has been observed returning
+# null and silently defeating the slow-feed window check.
+MIN_FEED_INTERVAL_SEC = 300
+
 # PetSafe returns schedule ids under different keys across firmware
 # versions; try them all.
 _SCHEDULE_ID_KEYS: tuple[str, ...] = (
@@ -215,6 +220,7 @@ class PetSafeFeeder(Generic):
     def __init__(self, name: str):
         super().__init__(name)
         self._feed_history: deque[dict] = deque(maxlen=FEED_HISTORY_MAX)
+        self._last_feed_mono: float = 0.0
 
     @classmethod
     def new(
@@ -604,11 +610,26 @@ class PetSafeFeeder(Generic):
         cause: str = "manual",
         schedule_id: str | None = None,
     ) -> dict:
+        now_mono = time.monotonic()
+        age = now_mono - self._last_feed_mono
+        if self._last_feed_mono > 0 and age < MIN_FEED_INTERVAL_SEC:
+            LOGGER.warning(
+                "feed refused: last feed %.0fs ago (floor %ds); cause=%s cups=%s",
+                age, MIN_FEED_INTERVAL_SEC, cause, cups,
+            )
+            raise RuntimeError(
+                f"last feed was {int(age)}s ago; refusing within "
+                f"{MIN_FEED_INTERVAL_SEC}s floor"
+            )
+        LOGGER.info(
+            "feed invoked: cups=%s cause=%s schedule_id=%s", cups, cause, schedule_id,
+        )
         eighths = max(1, round(cups * EIGHTHS_PER_CUP))
         feeder = await self._resolve_feeder()
         # slow=None defers to the feeder's own slow_feed setting.
         # update_data=False so we don't burn a status read after each feed.
         await feeder.feed(amount=eighths, slow_feed=slow, update_data=False)
+        self._last_feed_mono = time.monotonic()
         fed_cups = eighths / EIGHTHS_PER_CUP
         event: dict[str, Any] = {
             "event_type": "feed_dispensed",
