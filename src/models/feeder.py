@@ -321,7 +321,24 @@ class PetSafeFeeder(Generic):
                 refresh_token=self._tokens["refresh_token"],
                 access_token=self._tokens["access_token"],
             )
+            self._wrap_http_post(self._client)
         return self._client
+
+    def _wrap_http_post(self, pet_client: sf.PetSafeClient) -> None:
+        # Shim every outgoing POST through PetSafe so the audit log captures
+        # library-level duplicates that the _feed-level audit can't see
+        # (e.g. petsafe-api's 403-refresh retry path).
+        http = getattr(pet_client, "_client", None)
+        if http is None or not hasattr(http, "post"):
+            return
+        original_post = http.post
+
+        async def _logged_post(*args: Any, **kwargs: Any) -> Any:
+            url = args[0] if args else kwargs.get("url", "")
+            self._audit("http_post", url=str(url))
+            return await original_post(*args, **kwargs)
+
+        http.post = _logged_post
 
     async def _resolve_feeder(self) -> Any:
         if self._feeder is not None:
