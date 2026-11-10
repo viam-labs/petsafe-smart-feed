@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -51,6 +52,7 @@ def _extract_schedule_id(entry: dict) -> str | None:
 
 
 DEFAULT_STATE_PATH = "~/.viam/petsafe-smart-feed-state.json"
+AUDIT_LOG_SIBLING = ".audit.log"
 
 BG_LOOP_INTERVAL_SEC = 60
 
@@ -383,6 +385,24 @@ class PetSafeFeeder(Generic):
         tmp.write_text(json.dumps(self._state, indent=2))
         tmp.replace(path)
 
+    def _audit(self, stage: str, **fields: Any) -> None:
+        # Append-only, survives reconfigures and process crashes; the point of
+        # the whole file is forensics for the recurring double-dispense bug,
+        # so any failure here must not affect the feed path itself.
+        try:
+            path = Path(self.state_path).expanduser().with_suffix(AUDIT_LOG_SIBLING)
+            record = {
+                "at": datetime.now(UTC).isoformat(),
+                "stage": stage,
+                "pid": os.getpid(),
+                **fields,
+            }
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            LOGGER.warning("audit write failed (%s): %s", stage, e)
+
     def _seed_floor_from_state(self) -> None:
         # monotonic() resets per process, so translate the persisted wall-clock
         # timestamp into an equivalent monotonic value so the existing floor
@@ -639,6 +659,10 @@ class PetSafeFeeder(Generic):
                 "feed refused: last feed %.0fs ago (floor %ds); cause=%s cups=%s",
                 age, MIN_FEED_INTERVAL_SEC, cause, cups,
             )
+            self._audit(
+                "floor_refused", cause=cause, cups=cups, schedule_id=schedule_id,
+                age_since_last_s=round(age, 3),
+            )
             raise RuntimeError(
                 f"last feed was {int(age)}s ago; refusing within "
                 f"{MIN_FEED_INTERVAL_SEC}s floor"
@@ -648,9 +672,24 @@ class PetSafeFeeder(Generic):
         )
         eighths = max(1, round(cups * EIGHTHS_PER_CUP))
         feeder = await self._resolve_feeder()
-        # slow=None defers to the feeder's own slow_feed setting.
-        # update_data=False so we don't burn a status read after each feed.
-        await feeder.feed(amount=eighths, slow_feed=slow, update_data=False)
+        self._audit(
+            "attempt", cause=cause, cups=cups, schedule_id=schedule_id,
+            eighths=eighths, slow=slow,
+        )
+        try:
+            # slow=None defers to the feeder's own slow_feed setting.
+            # update_data=False so we don't burn a status read after each feed.
+            await feeder.feed(amount=eighths, slow_feed=slow, update_data=False)
+        except Exception as e:
+            self._audit(
+                "error", cause=cause, cups=cups, schedule_id=schedule_id,
+                error=f"{type(e).__name__}: {e}",
+            )
+            raise
+        self._audit(
+            "success", cause=cause, cups=cups, schedule_id=schedule_id,
+            eighths=eighths,
+        )
         self._last_feed_mono = time.monotonic()
         fed_at_iso = datetime.now(UTC).isoformat()
         if self._state is not None:
