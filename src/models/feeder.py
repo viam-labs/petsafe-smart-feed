@@ -143,6 +143,7 @@ def _empty_state() -> dict:
         "schema_version": SCHEMA_VERSION,
         "schedules": [],
         "pause_until": None,
+        "last_fed_at": None,
     }
 
 
@@ -301,6 +302,7 @@ class PetSafeFeeder(Generic):
         self._state_lock = asyncio.Lock()
         self._state = self._load_state()
         self._migrated = self._state.get("schema_version") == SCHEMA_VERSION
+        self._seed_floor_from_state()
         if self._bg_task and not self._bg_task.done():
             self._bg_task.cancel()
         try:
@@ -364,6 +366,8 @@ class PetSafeFeeder(Generic):
             merged["schedules"] = valid
         if isinstance(loaded.get("pause_until"), str):
             merged["pause_until"] = loaded["pause_until"]
+        if isinstance(loaded.get("last_fed_at"), str):
+            merged["last_fed_at"] = loaded["last_fed_at"]
         if loaded.get("schema_version") == SCHEMA_VERSION:
             merged["schema_version"] = SCHEMA_VERSION
         else:
@@ -378,6 +382,24 @@ class PetSafeFeeder(Generic):
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(self._state, indent=2))
         tmp.replace(path)
+
+    def _seed_floor_from_state(self) -> None:
+        # monotonic() resets per process, so translate the persisted wall-clock
+        # timestamp into an equivalent monotonic value so the existing floor
+        # check keeps working. Older-than-floor values stay at 0.0 (no floor).
+        assert self._state is not None
+        last_iso = self._state.get("last_fed_at")
+        if not isinstance(last_iso, str):
+            return
+        try:
+            last_wall = datetime.fromisoformat(last_iso)
+        except ValueError:
+            return
+        if last_wall.tzinfo is None:
+            last_wall = last_wall.replace(tzinfo=UTC)
+        elapsed = (datetime.now(UTC) - last_wall.astimezone(UTC)).total_seconds()
+        if 0 <= elapsed < MIN_FEED_INTERVAL_SEC:
+            self._last_feed_mono = time.monotonic() - elapsed
 
     def _find_schedule(self, sid: str) -> dict | None:
         for s in (self._state or {}).get("schedules", []):
@@ -630,11 +652,18 @@ class PetSafeFeeder(Generic):
         # update_data=False so we don't burn a status read after each feed.
         await feeder.feed(amount=eighths, slow_feed=slow, update_data=False)
         self._last_feed_mono = time.monotonic()
+        fed_at_iso = datetime.now(UTC).isoformat()
+        if self._state is not None:
+            self._state["last_fed_at"] = fed_at_iso
+            try:
+                self._save_state()
+            except Exception as e:
+                LOGGER.warning("failed to persist last_fed_at: %s", e)
         fed_cups = eighths / EIGHTHS_PER_CUP
         event: dict[str, Any] = {
             "event_type": "feed_dispensed",
             "source": self.name,
-            "at": datetime.now(UTC).isoformat(),
+            "at": fed_at_iso,
             "cups": fed_cups,
             "cause": cause,
         }
